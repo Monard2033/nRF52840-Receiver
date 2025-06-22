@@ -1,0 +1,25 @@
+cmake:
+  application:
+    source-dir: C:/ncs/v3.0.2/zephyr/share/sysbuild
+  board:
+    name: nrf52840dongle
+    path:
+     - C:/ncs/v3.0.2/zephyr/boards/nordic/nrf52840dongle
+    qualifiers: nrf52840
+    revision: 
+  images:
+   - name: Receiver
+     source-dir: C:/ncs/v3.0.2/myproject/Receiver
+     type: MAIN
+  kconfig:
+    files:
+     - C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/empty.conf
+     - C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/empty.conf
+    user-files:
+     - C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/empty.conf
+  sysbuild: true
+version: 0.1.0
+west:
+  command: C:\ncs\toolchains\0b393f9e1b\opt\bin\Scripts\west build --build-dir c:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild c:/ncs/v3.0.2/myproject/Receiver --pristine --board nrf52840dongle/nrf52840 -- -DCONF_FILE=prj.conf
+  topdir: c:\ncs\v3.0.2
+  version: 1.2.0

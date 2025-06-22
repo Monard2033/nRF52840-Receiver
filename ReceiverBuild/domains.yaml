@@ -1,0 +1,7 @@
+default: Receiver
+build_dir: C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild
+domains:
+  - name: Receiver
+    build_dir: C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/Receiver
+flash_order:
+  - Receiver

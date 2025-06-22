@@ -1,0 +1,13 @@
+# Target labels
+ Receiver
+# Source files and their labels
+C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/CMakeFiles/Receiver
+C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/CMakeFiles/Receiver.rule
+C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/CMakeFiles/Receiver-complete.rule
+C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/Receiver-prefix/src/Receiver-stamp/Receiver-build.rule
+C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/Receiver-prefix/src/Receiver-stamp/Receiver-configure.rule
+C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/Receiver-prefix/src/Receiver-stamp/Receiver-download.rule
+C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/Receiver-prefix/src/Receiver-stamp/Receiver-install.rule
+C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/Receiver-prefix/src/Receiver-stamp/Receiver-mkdir.rule
+C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/Receiver-prefix/src/Receiver-stamp/Receiver-patch.rule
+C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/Receiver-prefix/src/Receiver-stamp/Receiver-update.rule

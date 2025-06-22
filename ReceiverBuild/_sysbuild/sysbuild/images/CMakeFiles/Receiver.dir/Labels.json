@@ -1,0 +1,43 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/CMakeFiles/Receiver"
+		},
+		{
+			"file" : "C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/CMakeFiles/Receiver.rule"
+		},
+		{
+			"file" : "C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/CMakeFiles/Receiver-complete.rule"
+		},
+		{
+			"file" : "C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/Receiver-prefix/src/Receiver-stamp/Receiver-build.rule"
+		},
+		{
+			"file" : "C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/Receiver-prefix/src/Receiver-stamp/Receiver-configure.rule"
+		},
+		{
+			"file" : "C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/Receiver-prefix/src/Receiver-stamp/Receiver-download.rule"
+		},
+		{
+			"file" : "C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/Receiver-prefix/src/Receiver-stamp/Receiver-install.rule"
+		},
+		{
+			"file" : "C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/Receiver-prefix/src/Receiver-stamp/Receiver-mkdir.rule"
+		},
+		{
+			"file" : "C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/Receiver-prefix/src/Receiver-stamp/Receiver-patch.rule"
+		},
+		{
+			"file" : "C:/ncs/v3.0.2/myproject/Receiver/ReceiverBuild/_sysbuild/sysbuild/images/Receiver-prefix/src/Receiver-stamp/Receiver-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"Receiver"
+		],
+		"name" : "Receiver"
+	}
+}
