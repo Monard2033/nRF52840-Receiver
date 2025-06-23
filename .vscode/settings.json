@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "string.h": "c",
+        "usb_hid.h": "c"
+    }
+}
