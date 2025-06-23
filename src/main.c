@@ -216,10 +216,6 @@
         }
     }
  
-     while (!configured) {
-         k_sleep(K_MSEC(100));
-     }
- 
      /* --- Initialize ESB --- */
      esb_config.protocol = ESB_PROTOCOL_ESB_DPL;
      esb_config.mode = ESB_MODE_PRX; // Receiver mode
@@ -248,12 +244,12 @@
          return 0;
      }
  
-     err = esb_start_tx();
+     err = esb_start_rx();
      if (err) {
-         LOG_ERR("Failed to start ESB TX, err %d", err);
+         LOG_ERR("Failed to start ESB RX, err %d", err);
          return 0;
      }
-     LOG_INF("ESB Transmitter initialized and started successfully.");
+     LOG_INF("ESB Receiver initialized and started successfully.");
  
      while (1) {
          k_sleep(K_SECONDS(1));
