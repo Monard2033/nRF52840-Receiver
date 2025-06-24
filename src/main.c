@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2024 Monard2033
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-License-Identifier: Apache-2.0
  */
 
  #include <zephyr/kernel.h>
@@ -8,95 +8,76 @@
  #include <zephyr/usb/class/usb_hid.h>
  #include <zephyr/logging/log.h>
  #include <zephyr/device.h>
- #include <zephyr/drivers/clock_control.h>
  #include <esb.h>
  #include <string.h>
  
- LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
+ LOG_MODULE_REGISTER(RECEIVER, LOG_LEVEL_INF);
  
  /* --- ESB Configuration --- */
-  /* --- ESB Configuration --- */
-  static struct esb_payload rx_payload; // For receiving data
+ static struct esb_payload rx_payload;
  static struct esb_config esb_config = ESB_DEFAULT_CONFIG;
  
  /* --- USB HID Configuration --- */
  static const struct device *hid_dev;
- static volatile bool configured = false;
+ static K_SEM_DEFINE(usb_configured_sem, 0, 1);
+ static volatile bool configured = true; /* Set by default for testing */
  
  /* Key Configuration */
- #define KEY_CTRL_CODE_MIN 224 /* Control key codes - required 8 of them */
- #define KEY_CTRL_CODE_MAX 231 /* Control key codes - required 8 of them */
- #define KEY_CODE_MIN      0   /* Normal key codes */
- #define KEY_CODE_MAX      101 /* Normal key codes */
- #define KEY_PRESS_MAX     6   /* Maximum number of non-control keys pressed */
- #define INPUT_REPORT_KEYS_MAX_LEN (1 + 1 + KEY_PRESS_MAX) /* 1B ctrl, 1B reserved, 6B keys */
+ #define KEY_CTRL_CODE_MIN 224
+ #define KEY_CTRL_CODE_MAX 231
+ #define KEY_CODE_MIN      0
+ #define KEY_CODE_MAX      101
+ #define KEY_PRESS_MAX     6
+ #define INPUT_REPORT_KEYS_MAX_LEN (1 + 1 + KEY_PRESS_MAX)
  
  BUILD_ASSERT((KEY_CTRL_CODE_MAX - KEY_CTRL_CODE_MIN) + 1 == 8);
  
  /* HID Report Descriptor for a standard keyboard */
  static const uint8_t hid_report_desc[] = {
-     0x05, 0x01,       // Usage Page (Generic Desktop)
-     0x09, 0x06,       // Usage (Keyboard)
-     0xA1, 0x01,       // Collection (Application)
-     0x75, 0x01,       // Report Size (1)
-     0x95, 0x08,       // Report Count (8)
-     0x05, 0x07,       // Usage Page (Key Codes)
-     0x19, 0xE0,       // Usage Minimum (0xE0 - Left Control)
-     0x29, 0xE7,       // Usage Maximum (0xE7 - Right GUI)
-     0x15, 0x00,       // Logical Minimum (0)
-     0x25, 0x01,       // Logical Maximum (1)
-     0x81, 0x02,       // Input (Data, Variable, Absolute) - Modifier byte
-     0x95, 0x01,       // Report Count (1)
-     0x75, 0x08,       // Report Size (8)
-     0x81, 0x01,       // Input (Constant) - Reserved byte
-     0x95, 0x06,       // Report Count (6)
-     0x75, 0x08,       // Report Size (8)
-     0x15, 0x00,       // Logical Minimum (0)
-     0x25, 0x65,       // Logical Maximum (101 - Max key code)
-     0x05, 0x07,       // Usage Page (Key Codes)
-     0x19, 0x00,       // Usage Minimum (0x00)
-     0x29, 0x65,       // Usage Maximum (0x65)
-     0x81, 0x00,       // Input (Data, Array) - Key codes
-     0xC0              // End Collection
+     0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x75, 0x01,
+     0x95, 0x08, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7,
+     0x15, 0x00, 0x25, 0x01, 0x81, 0x02, 0x95, 0x01,
+     0x75, 0x08, 0x81, 0x01, 0x95, 0x06, 0x75, 0x08,
+     0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00,
+     0x29, 0x65, 0x81, 0x00, 0xC0
  };
-
-
+ 
  /* Keyboard State */
  static struct keyboard_state {
-     uint8_t ctrl_keys_state; /* Current keys state */
+     uint8_t ctrl_keys_state;
      uint8_t keys_state[KEY_PRESS_MAX];
  } hid_keyboard_state;
  
  static void usb_status_cb(enum usb_dc_status_code status, const uint8_t *param)
  {
      ARG_UNUSED(param);
- 
+     LOG_DBG("USB status callback: status=%d", status);
      switch (status) {
-        case USB_DC_CONFIGURED:
-            LOG_INF("USB_DC_CONFIGURED received, setting configured = true");
-            configured = true;
-            break;
-        case USB_DC_DISCONNECTED:
-            LOG_INF("USB_DC_DISCONNECTED received, setting configured = false");
-            configured = false;
-            break;
-        case USB_DC_RESET:
-            LOG_INF("USB_DC_RESET received, setting configured = false");
-            configured = false;
-            break;
-        case USB_DC_SUSPEND:
-            LOG_INF("USB_DC_SUSPEND received");
-            break;
-        case USB_DC_RESUME:
-            LOG_INF("USB_DC_RESUME received");
-            break;
-        default:
-            LOG_DBG("Unknown USB status code: %d", status);
-            break;
-    }
+     case USB_DC_CONFIGURED:
+         LOG_INF("USB_DC_CONFIGURED received, setting configured = true");
+         configured = true;
+         k_sem_give(&usb_configured_sem);
+         break;
+     case USB_DC_DISCONNECTED:
+         LOG_INF("USB_DC_DISCONNECTED received, setting configured = false");
+         configured = false;
+         break;
+     case USB_DC_RESET:
+         LOG_INF("USB_DC_RESET received, setting configured = false");
+         configured = false;
+         break;
+     case USB_DC_SUSPEND:
+         LOG_INF("USB_DC_SUSPEND received");
+         break;
+     case USB_DC_RESUME:
+         LOG_INF("USB_DC_RESUME received");
+         break;
+     default:
+         LOG_DBG("Unknown USB status code: %d", status);
+         break;
+     }
  }
-
-
+ 
  void receiver_esb_event_handler(struct esb_evt const *event)
  {
      switch (event->evt_id) {
@@ -106,53 +87,44 @@
      case ESB_EVENT_TX_FAILED:
          LOG_ERR("TX failed (unexpected in PRX mode)");
          break;
-         case ESB_EVENT_RX_RECEIVED:
-         if (esb_read_rx_payload(&rx_payload) == 0) {
-             LOG_INF("Received Payload (length: %d bytes)", rx_payload.length);
-             LOG_INF("Data: D+ = %d, D- = %d", rx_payload.data[0], rx_payload.data[1]);
-             LOG_HEXDUMP_INF(rx_payload.data, rx_payload.length, "Raw Payload");
- 
-             if (rx_payload.length == 8) {
-                 LOG_INF("Processing HID report (8 bytes)");
-                 if (hid_dev && configured) {
-                     uint8_t hid_report[8] = {0};
-                     memcpy(hid_report, rx_payload.data, 8);
-                     int ret = hid_int_ep_write(hid_dev, hid_report, 8, NULL);
-                     if (ret != 8) {
-                         LOG_ERR("Failed to send HID report over USB: %d", ret);
-                     } else {
-                         LOG_INF("HID report sent successfully");
-                     }
-                 } else {
-                     LOG_WRN("USB not ready or configured, discarding HID report.");
-                 }
-             } else if (rx_payload.length == 2) {
-                 LOG_INF("Received test payload (2 bytes): D+ = %d, D- = %d", rx_payload.data[0], rx_payload.data[1]);
-             } else {
-                 LOG_WRN("Unexpected payload length: %d", rx_payload.length);
-                 LOG_HEXDUMP_INF(rx_payload.data, rx_payload.length, "Unexpected Payload");
-             }
-         } else {
-             LOG_ERR("Failed to read RX payload");
-         }
-         break;
-     }
- }
-
+     case ESB_EVENT_RX_RECEIVED:
+        if (esb_read_rx_payload(&rx_payload) == 0) {
+            LOG_INF("Received Payload (length: %d bytes)", rx_payload.length);
+            LOG_INF("Data: D+ = %d, D- = %d", rx_payload.data[0], rx_payload.data[1]);
+            LOG_HEXDUMP_INF(rx_payload.data, rx_payload.length, "Raw Payload");
+            if (rx_payload.length == 8) {
+                LOG_INF("Processing HID report (8 bytes)");
+                if (hid_dev && configured) {
+                    uint8_t hid_report[8] = {0};
+                    uint8_t release_report[8] = {0};
+                    memcpy(hid_report, rx_payload.data, 8);
+                    hid_int_ep_write(hid_dev, hid_report, 8, NULL);
+                    hid_int_ep_write(hid_dev, release_report, 8, NULL);
+            } else if (rx_payload.length == 2) {
+                LOG_INF("Received test payload (2 bytes): D+ = %d, D- = %d", rx_payload.data[0], rx_payload.data[1]);
+            } else {
+                LOG_WRN("Unexpected payload length: %d", rx_payload.length);
+                LOG_HEXDUMP_INF(rx_payload.data, rx_payload.length, "Unexpected Payload");
+            }
+        } else {
+            LOG_ERR("Failed to read RX payload");
+        }
+        break;
+        }
+    }
+}
  
  int main(void)
  {
      int err;
- 
      LOG_INF("Starting 2.4GHz HID Keyboard sample");
-
-     /* --- Initialize USB HID --- */
+     /* Initialize USB HID */
      hid_dev = device_get_binding("HID_0");
      if (!hid_dev) {
          LOG_ERR("Failed to get USB HID device 'HID_0'. Exiting.");
          return 0;
      }
-     LOG_INF("USB device node acquired, checking readyness...");
+     LOG_INF("USB device node acquired, checking readiness...");
      if (!device_is_ready(hid_dev)) {
          LOG_ERR("USB device not ready. Exiting.");
          return 0;
@@ -170,25 +142,22 @@
      LOG_INF("HID initialized.");
  
      LOG_INF("Waiting for hardware readiness before enabling USB...");
-
-    k_sleep(K_MSEC(500)); // Delay to allow hardware stabilization
-    LOG_INF("Attempting to enable USB...");
-    if(IS_ENABLED(CONFIG_USB_DEVICE_STACK)) {
-        err = usb_enable(NULL);
-        usb_dc_set_status_callback(&usb_status_cb);
-        if (err) {
-            LOG_ERR("Failed to enable USB, err %d", err);
-            return 0;
-        }
-        else {
-            LOG_INF("USB enabled successfully.");
-        }
-    }
+     k_sleep(K_MSEC(10));
+     LOG_INF("Attempting to enable USB...");
+     if (IS_ENABLED(CONFIG_USB_DEVICE_STACK)) {
+         usb_dc_set_status_callback(&usb_status_cb);
+         err = usb_enable(NULL);
+         if (err) {
+             LOG_ERR("Failed to enable USB, err %d", err);
+             return 0;
+         }
+         LOG_INF("USB enabled successfully.");
+     }
+     k_sleep(K_MSEC(350));
  
- 
-     /* --- Initialize ESB --- */
+     /* Initialize ESB */
      esb_config.protocol = ESB_PROTOCOL_ESB_DPL;
-     esb_config.mode = ESB_MODE_PRX; // Receiver mode
+     esb_config.mode = ESB_MODE_PRX;
      esb_config.bitrate = ESB_BITRATE_2MBPS;
      esb_config.payload_length = 8;
      esb_config.retransmit_count = 3;
@@ -220,7 +189,7 @@
          return 0;
      }
      LOG_INF("ESB Receiver initialized and started successfully.");
- 
+
      while (1) {
          k_sleep(K_SECONDS(1));
      }

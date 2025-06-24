@@ -57,6 +57,7 @@ C:/ncs/v3.0.2/zephyr/include\zephyr\usb
 C:/ncs/v3.0.2/zephyr/include\zephyr\usb_c
 C:/ncs/v3.0.2/zephyr/include\zephyr\xen
 C:/ncs/v3.0.2/zephyr/include\zephyr\zbus
+C:/ncs/v3.0.2/zephyr/include\zephyr\zmk
 C:/ncs/v3.0.2/zephyr/include\zephyr\zvfs
 C:/ncs/v3.0.2/zephyr/include\zephyr\arch\arc
 C:/ncs/v3.0.2/zephyr/include\zephyr\arch\arm
@@ -197,6 +198,7 @@ C:/ncs/v3.0.2/zephyr/include\zephyr\dt-bindings\timer
 C:/ncs/v3.0.2/zephyr/include\zephyr\dt-bindings\usb
 C:/ncs/v3.0.2/zephyr/include\zephyr\dt-bindings\usb-c
 C:/ncs/v3.0.2/zephyr/include\zephyr\dt-bindings\video
+C:/ncs/v3.0.2/zephyr/include\zephyr\dt-bindings\zmk
 C:/ncs/v3.0.2/zephyr/include\zephyr\dt-bindings\clock\silabs
 C:/ncs/v3.0.2/zephyr/include\zephyr\dt-bindings\pinctrl\renesas
 C:/ncs/v3.0.2/zephyr/include\zephyr\dt-bindings\pinctrl\silabs
