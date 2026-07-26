@@ -1,211 +1,377 @@
 /*
  * Copyright (c) 2024 Monard2033
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * Wireless keyboard receiver:
+ *   ESB PRX -> validated keyboard state -> USB boot-keyboard HID report.
  */
 
-#include <zephyr/kernel.h>
-#include <zephyr/usb/usb_device.h>
-#include <zephyr/usb/class/usb_hid.h>
-#include <zephyr/logging/log.h>
-#include <zephyr/device.h>
-#include <esb.h>
+#include <errno.h>
 #include <string.h>
 
-#define REPORT_ID               1
+#include <esb.h>
+#include <nrfx.h>
+#include <zephyr/device.h>
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
+#include <zephyr/sys/util.h>
+#include <zephyr/usb/class/hid.h>
+#include <zephyr/usb/class/usb_hid.h>
+#include <zephyr/usb/usb_device.h>
 
-LOG_MODULE_REGISTER(RECEIVER, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 
-/* --- ESB Configuration --- */
-static struct esb_payload rx_payload;
-static struct esb_payload tx_payload;
+#define KEYBOARD_REPORT_SIZE   8U
+#define LINK_MAGIC             0xA5U
+#define LINK_VERSION           0x01U
+#define LINK_TYPE_KEYBOARD     0x01U
+#define LINK_RF_CHANNEL        80U
+#define HID_QUEUE_DEPTH        32U
+
+/*
+ * This is the on-air packet shared with the transmitter. ESB already adds a
+ * CRC, acknowledgement, and retransmissions, so no application CRC is needed.
+ */
+struct link_keyboard_packet {
+	uint8_t magic;
+	uint8_t version;
+	uint8_t type;
+	uint8_t sequence;
+	uint8_t report[KEYBOARD_REPORT_SIZE];
+} __packed;
+
+struct keyboard_report {
+	uint8_t data[KEYBOARD_REPORT_SIZE];
+};
+
+BUILD_ASSERT(sizeof(struct link_keyboard_packet) == 12U);
+
+K_MSGQ_DEFINE(hid_report_queue, sizeof(struct keyboard_report),
+	      HID_QUEUE_DEPTH, sizeof(uint32_t));
+static K_SEM_DEFINE(hid_in_done, 0, 1);
+
+static const uint8_t hid_report_descriptor[] = HID_KEYBOARD_REPORT_DESC();
+static const struct device *hid_device;
+static atomic_t usb_configured;
+static atomic_t usb_suspended;
+
+static struct esb_payload esb_rx_payload;
 static struct esb_config esb_config = ESB_DEFAULT_CONFIG;
-static uint8_t last_hid_report[8] = {0};
-static bool new_report_available = false;
 
-/* --- USB HID Configuration --- */
-static const struct device *hid_dev;
-static K_SEM_DEFINE(usb_configured_sem, 0, 1);
-static volatile bool configured = false; /* Set by default for testing */
+static atomic_t radio_packets;
+static atomic_t radio_bad_packets;
+static atomic_t radio_duplicates;
+static atomic_t radio_last_rssi;
+static atomic_t radio_ready;
+static atomic_t radio_init_error;
+static atomic_t hid_queue_overruns;
+static atomic_t hid_reports_sent;
+static atomic_t hid_write_errors;
 
-/* Key Configuration */
-#define KEY_CTRL_CODE_MIN 224
-#define KEY_CTRL_CODE_MAX 231
-#define KEY_CODE_MIN      0
-#define KEY_CODE_MAX      101
-#define KEY_PRESS_MAX     6
-#define INPUT_REPORT_KEYS_MAX_LEN (1 + 1 + KEY_PRESS_MAX)
+/*
+ * The ESB event handler runs in interrupt context. It may use a message queue
+ * with K_NO_WAIT, but it must not call the USB HID endpoint API directly.
+ */
+static void queue_hid_report(const uint8_t report[KEYBOARD_REPORT_SIZE])
+{
+	struct keyboard_report item;
 
-BUILD_ASSERT((KEY_CTRL_CODE_MAX - KEY_CTRL_CODE_MIN) + 1 == 8);
+	memcpy(item.data, report, sizeof(item.data));
+	if (k_msgq_put(&hid_report_queue, &item, K_NO_WAIT) == 0) {
+		return;
+	}
 
-/* Packet Types */
-enum packet_type {
-    PACKET_TYPE_GPIO_DATA = 0x05,
-    PACKET_TYPE_BATTERY_VOLTAGE = 0x06
-};
+	/*
+	 * HID keyboard packets describe the complete current key state. If the
+	 * consumer falls behind, discard the oldest state and retain the newest
+	 * one so that a key-release report cannot remain stuck indefinitely.
+	 */
+	struct keyboard_report discarded;
 
-/* HID Report Descriptor for a standard keyboard */
-static const uint8_t hid_report_desc[] = {
-    0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x75, 0x01,
-    0x95, 0x08, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7,
-    0x15, 0x00, 0x25, 0x01, 0x81, 0x02, 0x95, 0x01,
-    0x75, 0x08, 0x81, 0x01, 0x95, 0x06, 0x75, 0x08,
-    0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00,
-    0x29, 0x65, 0x81, 0x00, 0xC0
-};
-
-/* Custom USB endpoint descriptor for 1ms polling */
-static const uint8_t hid_ep_descriptor[] = {
-    0x07,          // bLength: Endpoint descriptor size
-    0x05,          // bDescriptorType: Endpoint
-    0x81,          // bEndpointAddress: IN endpoint 1 (0x80 | 0x01)
-    0x03,          // bmAttributes: Interrupt
-    0x08, 0x00,    // wMaxPacketSize: 8 bytes (for HID report)
-    0x01           // bInterval: 1ms polling interval
-};
-
-static void int_in_ready_cb(const struct device *dev) {
-    if (configured && new_report_available) {
-        LOG_INF("IN endpoint ready to send data. Sending report: %02x %02x %02x %02x %02x %02x %02x %02x",
-                last_hid_report[0], last_hid_report[1], last_hid_report[2], last_hid_report[3],
-                last_hid_report[4], last_hid_report[5], last_hid_report[6], last_hid_report[7]);
-        if (hid_int_ep_write(dev, last_hid_report, 8, NULL)) {
-            LOG_ERR("Failed to submit HID report");
-        } else {
-            new_report_available = false; // Clear flag after sending
-        }
-    }
+	atomic_inc(&hid_queue_overruns);
+	if (k_msgq_get(&hid_report_queue, &discarded, K_NO_WAIT) == 0) {
+		(void)k_msgq_put(&hid_report_queue, &item, K_NO_WAIT);
+	}
 }
 
-static const struct hid_ops my_hid_ops = {
-    .int_in_ready = int_in_ready_cb,
+static void receiver_esb_event_handler(const struct esb_evt *event)
+{
+	static bool previous_packet_valid;
+	static uint8_t previous_sequence;
+	static uint8_t previous_report[KEYBOARD_REPORT_SIZE];
+
+	if (event->evt_id != ESB_EVENT_RX_RECEIVED) {
+		return;
+	}
+
+	while (esb_read_rx_payload(&esb_rx_payload) == 0) {
+		struct link_keyboard_packet packet;
+
+		atomic_inc(&radio_packets);
+		atomic_set(&radio_last_rssi, esb_rx_payload.rssi);
+		if (esb_rx_payload.length != sizeof(packet)) {
+			atomic_inc(&radio_bad_packets);
+			continue;
+		}
+
+		memcpy(&packet, esb_rx_payload.data, sizeof(packet));
+		if (packet.magic != LINK_MAGIC ||
+		    packet.version != LINK_VERSION ||
+		    packet.type != LINK_TYPE_KEYBOARD) {
+			atomic_inc(&radio_bad_packets);
+			continue;
+		}
+
+		/* An application retry uses the same sequence and report. */
+		if (previous_packet_valid &&
+		    packet.sequence == previous_sequence &&
+		    memcmp(packet.report, previous_report,
+			   sizeof(previous_report)) == 0) {
+			atomic_inc(&radio_duplicates);
+			continue;
+		}
+
+		previous_packet_valid = true;
+		previous_sequence = packet.sequence;
+		memcpy(previous_report, packet.report, sizeof(previous_report));
+		queue_hid_report(packet.report);
+	}
+}
+
+static int esb_initialize(void)
+{
+	static const uint8_t base_address_0[4] = {
+		0xE7, 0xE7, 0xE7, 0xE7
+	};
+	static const uint8_t base_address_1[4] = {
+		0xC2, 0xC2, 0xC2, 0xC2
+	};
+	static const uint8_t address_prefixes[8] = {
+		0xE7, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8
+	};
+	int err;
+
+	esb_config.protocol = ESB_PROTOCOL_ESB_DPL;
+	esb_config.mode = ESB_MODE_PRX;
+	esb_config.bitrate = ESB_BITRATE_1MBPS;
+	esb_config.tx_output_power = ESB_TX_POWER_8DBM;
+	esb_config.payload_length = sizeof(struct link_keyboard_packet);
+	esb_config.selective_auto_ack = true;
+	esb_config.event_handler = receiver_esb_event_handler;
+
+	err = esb_init(&esb_config);
+	if (err != 0) {
+		return err;
+	}
+
+	err = esb_set_base_address_0(base_address_0);
+	if (err != 0) {
+		return err;
+	}
+
+	err = esb_set_base_address_1(base_address_1);
+	if (err != 0) {
+		return err;
+	}
+
+	err = esb_set_prefixes(address_prefixes, ARRAY_SIZE(address_prefixes));
+	if (err != 0) {
+		return err;
+	}
+
+	err = esb_set_rf_channel(LINK_RF_CHANNEL);
+	if (err != 0) {
+		return err;
+	}
+
+	return esb_start_rx();
+}
+
+static void hid_int_in_ready(const struct device *dev)
+{
+	ARG_UNUSED(dev);
+	k_sem_give(&hid_in_done);
+}
+
+static const struct hid_ops hid_ops = {
+	.int_in_ready = hid_int_in_ready,
 };
 
-static void usb_status_cb(enum usb_dc_status_code status, const uint8_t *param) {
-    ARG_UNUSED(param);
-    LOG_DBG("USB status callback: status=%d", status);
-    switch (status) {
-    case USB_DC_CONFIGURED:
-        LOG_INF("USB_DC_CONFIGURED received, setting configured = true");
-        configured = true;
-        k_sem_give(&usb_configured_sem);
-        break;
-    default:
-        LOG_DBG("Unknown USB status code: %d", status);
-        break;
-    }
+static void usb_status_callback(enum usb_dc_status_code status,
+				const uint8_t *param)
+{
+	ARG_UNUSED(param);
+
+	switch (status) {
+	case USB_DC_CONFIGURED:
+		atomic_set(&usb_configured, 1);
+		atomic_set(&usb_suspended, 0);
+		break;
+	case USB_DC_SUSPEND:
+		atomic_set(&usb_suspended, 1);
+		/* Release a sender if the host suspends with an IN pending. */
+		k_sem_give(&hid_in_done);
+		break;
+	case USB_DC_RESUME:
+		atomic_set(&usb_suspended, 0);
+		break;
+	case USB_DC_RESET:
+	case USB_DC_DISCONNECTED:
+		atomic_set(&usb_configured, 0);
+		atomic_set(&usb_suspended, 0);
+		/* Release a sender if the endpoint disappeared. */
+		k_sem_give(&hid_in_done);
+		break;
+	default:
+		break;
+	}
 }
 
-void receiver_esb_event_handler(struct esb_evt const *event) {
-    switch (event->evt_id) {
-    case ESB_EVENT_TX_SUCCESS:
-        LOG_INF("TX success (ACK payload sent)");
-        break;
-    case ESB_EVENT_TX_FAILED:
-        LOG_ERR("TX failed for ACK payload");
-        break;
-    case ESB_EVENT_RX_RECEIVED:
-        while (esb_read_rx_payload(&rx_payload) == 0) {
-            LOG_INF("Received Payload (length: %d bytes)", rx_payload.length);
-            LOG_HEXDUMP_INF(rx_payload.data, rx_payload.length, "Raw Payload");
-            if (rx_payload.length == 8) {
-                uint8_t packet_type = rx_payload.data[0];
-                if (packet_type == PACKET_TYPE_GPIO_DATA) {
-                    LOG_INF("Received GPIO data: D+ = %d, D- = %d", rx_payload.data[1], rx_payload.data[2]);
-                    if (hid_dev && configured) {
-                        uint8_t hid_report[8] = {REPORT_ID, rx_payload.data[1] ? 0xE0 : 0x00, 0x00, rx_payload.data[2] ? 0x04 : 0x00, 0x00, 0x00, 0x00, 0x00};
-                        memcpy(last_hid_report, hid_report, 8);
-                        new_report_available = true;
-                        if (hid_int_ep_write(hid_dev, last_hid_report, 8, NULL)) {
-                            LOG_ERR("Failed to submit HID report for GPIO data");
-                        } else {
-                            LOG_INF("HID report sent to USB host");
-                            new_report_available = false;
-                        }
-                    }
-                } else if (packet_type == PACKET_TYPE_BATTERY_VOLTAGE) {
-                    uint32_t voltage_mv;
-                    memcpy(&voltage_mv, rx_payload.data + 1, sizeof(voltage_mv)); // Skip packet type, read 4 bytes
-                    LOG_INF("Received battery voltage: %d mV", voltage_mv);
-                    // No HID report for voltage, only terminal logging
-                } else {
-                    LOG_WRN("Unknown packet type: 0x%02x", packet_type);
-                }
-            } else {
-                LOG_WRN("Invalid payload: length=%d, expected 8 bytes", rx_payload.length);
-            }
-        }
-        break;
-    }
+static bool usb_hid_ready(void)
+{
+	return atomic_get(&usb_configured) != 0 &&
+	       atomic_get(&usb_suspended) == 0;
 }
 
-int main(void) {
-    int err;
-    LOG_INF("Starting 2.4GHz HID Keyboard Receiver");
+static int send_hid_report(const struct keyboard_report *report)
+{
+	int err;
 
-    /* Initialize USB HID */
-    hid_dev = device_get_binding("HID_0");
-    if (!hid_dev) {
-        LOG_ERR("Failed to get HID_0 device");
-    }
-    LOG_INF("USB device found and ready.");
+	if (!usb_hid_ready()) {
+		return -ENOTCONN;
+	}
 
-    usb_hid_register_device(hid_dev, hid_report_desc, sizeof(hid_report_desc), &my_hid_ops);
-    LOG_INF("HID registered.");
+	k_sem_reset(&hid_in_done);
+	err = hid_int_ep_write(hid_device, report->data, sizeof(report->data),
+			       NULL);
+	if (err != 0) {
+		atomic_inc(&hid_write_errors);
+		return err;
+	}
 
-    err = usb_hid_init(hid_dev);
-    if (err) {
-        LOG_ERR("Failed to init USB HID, err %d", err);
-    }
-    LOG_INF("HID initialized.");
+	/*
+	 * Serialize endpoint writes. The USB callback also releases this wait
+	 * on disconnect/suspend, preventing the bridge thread from hanging.
+	 */
+	k_sem_take(&hid_in_done, K_FOREVER);
+	if (!usb_hid_ready()) {
+		return -ENOTCONN;
+	}
 
-    LOG_INF("Attempting to enable USB...");
-    if (IS_ENABLED(CONFIG_USB_DEVICE_STACK)) {
-        usb_dc_set_status_callback(&usb_status_cb);
-        err = usb_enable(&usb_status_cb);
-        if (err) {
-            LOG_ERR("Failed to enable USB, err %d", err);
-        }
-        LOG_INF("USB enabled successfully.");
-    }
+	atomic_inc(&hid_reports_sent);
+	return 0;
+}
 
-    /* Initialize ESB */
-    esb_config.protocol = ESB_PROTOCOL_ESB_DPL;
-    esb_config.mode = ESB_MODE_PRX;
-    esb_config.bitrate = ESB_BITRATE_2MBPS;
-    esb_config.payload_length = 8; // Updated to match 8-byte payload
-    esb_config.retransmit_count = 3;
-    esb_config.event_handler = receiver_esb_event_handler;
-    esb_config.selective_auto_ack = true;
+static int usb_hid_initialize(void)
+{
+	int err;
 
-    err = esb_init(&esb_config);
-    if (err) {
-        LOG_ERR("ESB initialization failed, err %d", err);
-        return err;
-    }
+	hid_device = device_get_binding("HID_0");
+	if (hid_device == NULL) {
+		return -ENODEV;
+	}
 
-    uint8_t base_addr_0[4] = {0xAB, 0x12, 0xCD, 0x34};
-    err = esb_set_base_address_0(base_addr_0);
-    if (err) {
-        LOG_ERR("Failed to set base address 0, err %d", err);
-        return err;
-    }
+	usb_hid_register_device(hid_device, hid_report_descriptor,
+				sizeof(hid_report_descriptor), &hid_ops);
 
-    uint8_t prefixes[8] = {0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8};
-    err = esb_set_prefixes(prefixes, 8);
-    if (err) {
-        LOG_ERR("Failed to set prefixes, err %d", err);
-        return err;
-    }
+	err = usb_hid_init(hid_device);
+	if (err != 0) {
+		return err;
+	}
 
-    err = esb_start_rx();
-    if (err) {
-        LOG_ERR("Failed to start ESB RX, err %d", err);
-        return err;
-    }
-    LOG_INF("ESB Receiver initialized and started successfully.");
+	return usb_enable(usb_status_callback);
+}
 
-    while (1) {
-        k_sleep(K_SECONDS(1));
-    }
-    return 0;
+static void status_thread(void)
+{
+	for (;;) {
+		k_sleep(K_SECONDS(5));
+		LOG_INF("USB=%s ESB=%s init_err=%ld radio=%ld rssi=%ld bad=%ld dup=%ld "
+			"queue_drop=%ld HID=%ld err=%ld "
+			"RF[state=%lu cfg_ch=%u reg_ch=%lu mode=%lu pipes=0x%02lx] "
+			"HF=0x%08lx",
+			usb_hid_ready() ? "ready" : "offline",
+			atomic_get(&radio_ready) != 0 ? "ready" : "offline",
+			(long)atomic_get(&radio_init_error),
+			(long)atomic_get(&radio_packets),
+			(long)atomic_get(&radio_last_rssi),
+			(long)atomic_get(&radio_bad_packets),
+			(long)atomic_get(&radio_duplicates),
+			(long)atomic_get(&hid_queue_overruns),
+			(long)atomic_get(&hid_reports_sent),
+			(long)atomic_get(&hid_write_errors),
+			(unsigned long)NRF_RADIO->STATE,
+			LINK_RF_CHANNEL,
+			(unsigned long)NRF_RADIO->FREQUENCY,
+			(unsigned long)NRF_RADIO->MODE,
+			(unsigned long)NRF_RADIO->RXADDRESSES,
+			(unsigned long)NRF_CLOCK->HFCLKSTAT);
+	}
+}
+
+K_THREAD_DEFINE(status_thread_id, 1024, status_thread,
+		NULL, NULL, NULL, 7, 0, 0);
+
+int main(void)
+{
+	struct keyboard_report current = { 0 };
+	int err;
+
+	LOG_INF("Starting ESB-to-USB keyboard receiver");
+
+	/*
+	 * Enumerate USB first. A radio initialization failure must never make
+	 * the HID/CDC composite device disappear from the host.
+	 */
+	err = usb_hid_initialize();
+	if (err != 0) {
+		LOG_ERR("USB HID initialization failed: %d", err);
+		return err;
+	}
+
+	err = esb_initialize();
+	if (err != 0) {
+		atomic_set(&radio_init_error, err);
+		LOG_ERR("ESB initialization failed: %d; USB remains available", err);
+	} else {
+		atomic_set(&radio_ready, 1);
+		LOG_INF("Ready: ESB PRX channel %u, pipe 0 address E7:E7E7E7E7, "
+			"USB boot keyboard", LINK_RF_CHANNEL);
+	}
+
+	for (;;) {
+		if (!usb_hid_ready()) {
+			/*
+			 * Keep only the most recent wireless state while the PC is
+			 * absent. On enumeration, that state is sent immediately.
+			 */
+			while (k_msgq_get(&hid_report_queue, &current,
+					  K_NO_WAIT) == 0) {
+			}
+			k_msleep(10);
+			continue;
+		}
+
+		/* Coalesce states accumulated during USB enumeration. */
+		struct keyboard_report queued;
+
+		while (k_msgq_get(&hid_report_queue, &queued, K_NO_WAIT) == 0) {
+			current = queued;
+		}
+
+		(void)send_hid_report(&current);
+
+		/*
+		 * Once configured, preserve every state transition in order.
+		 * A short timeout also lets disconnect/suspend state be observed.
+		 */
+		while (usb_hid_ready()) {
+			if (k_msgq_get(&hid_report_queue, &current,
+				       K_MSEC(20)) == 0) {
+				(void)send_hid_report(&current);
+			}
+		}
+
+	}
 }
