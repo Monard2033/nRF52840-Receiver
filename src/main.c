@@ -98,7 +98,6 @@ static void queue_hid_report(const uint8_t report[KEYBOARD_REPORT_SIZE])
 static void receiver_esb_event_handler(const struct esb_evt *event)
 {
 	static bool previous_packet_valid;
-	static uint8_t previous_sequence;
 	static uint8_t previous_report[KEYBOARD_REPORT_SIZE];
 
 	if (event->evt_id != ESB_EVENT_RX_RECEIVED) {
@@ -123,9 +122,11 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			continue;
 		}
 
-		/* An application retry uses the same sequence and report. */
+		/*
+		 * Reports are complete states. Keepalives and RF retries do not
+		 * need to enter the HID transition queue when the state is equal.
+		 */
 		if (previous_packet_valid &&
-		    packet.sequence == previous_sequence &&
 		    memcmp(packet.report, previous_report,
 			   sizeof(previous_report)) == 0) {
 			atomic_inc(&radio_duplicates);
@@ -133,7 +134,6 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 		}
 
 		previous_packet_valid = true;
-		previous_sequence = packet.sequence;
 		memcpy(previous_report, packet.report, sizeof(previous_report));
 		queue_hid_report(packet.report);
 	}
@@ -154,10 +154,11 @@ static int esb_initialize(void)
 
 	esb_config.protocol = ESB_PROTOCOL_ESB_DPL;
 	esb_config.mode = ESB_MODE_PRX;
-	esb_config.bitrate = ESB_BITRATE_1MBPS;
+	esb_config.bitrate = ESB_BITRATE_2MBPS;
 	esb_config.tx_output_power = ESB_TX_POWER_8DBM;
 	esb_config.payload_length = sizeof(struct link_keyboard_packet);
 	esb_config.selective_auto_ack = true;
+	esb_config.use_fast_ramp_up = true;
 	esb_config.event_handler = receiver_esb_event_handler;
 
 	err = esb_init(&esb_config);
@@ -336,8 +337,9 @@ int main(void)
 		LOG_ERR("ESB initialization failed: %d; USB remains available", err);
 	} else {
 		atomic_set(&radio_ready, 1);
-		LOG_INF("Ready: ESB PRX channel %u, pipe 0 address E7:E7E7E7E7, "
-			"USB boot keyboard", LINK_RF_CHANNEL);
+		LOG_INF("Ready: ESB PRX 2 Mbps channel %u, pipe 0 address "
+			"E7:E7E7E7E7, USB boot keyboard at 1 kHz",
+			LINK_RF_CHANNEL);
 	}
 
 	for (;;) {
@@ -349,29 +351,16 @@ int main(void)
 			while (k_msgq_get(&hid_report_queue, &current,
 					  K_NO_WAIT) == 0) {
 			}
-			k_msleep(10);
+			k_msleep(1);
 			continue;
 		}
 
-		/* Coalesce states accumulated during USB enumeration. */
 		struct keyboard_report queued;
 
-		while (k_msgq_get(&hid_report_queue, &queued, K_NO_WAIT) == 0) {
+		if (k_msgq_get(&hid_report_queue, &queued, K_NO_WAIT) == 0) {
 			current = queued;
 		}
 
 		(void)send_hid_report(&current);
-
-		/*
-		 * Once configured, preserve every state transition in order.
-		 * A short timeout also lets disconnect/suspend state be observed.
-		 */
-		while (usb_hid_ready()) {
-			if (k_msgq_get(&hid_report_queue, &current,
-				       K_MSEC(20)) == 0) {
-				(void)send_hid_report(&current);
-			}
-		}
-
 	}
 }
