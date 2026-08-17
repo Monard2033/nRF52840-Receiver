@@ -31,6 +31,8 @@ LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 #define HID_QUEUE_DEPTH        32U
 #define HID_REPORT_ID_KEYBOARD 0x01U
 #define HID_REPORT_ID_CONSUMER 0x02U
+#define KEYBOARD_LINK_TIMEOUT_MS 250U
+#define HID_WRITE_TIMEOUT_MS     20U
 
 /*
  * This is the on-air packet shared with the transmitter. ESB already adds a
@@ -118,35 +120,44 @@ static atomic_t radio_init_error;
 static atomic_t hid_queue_overruns;
 static atomic_t hid_reports_sent;
 static atomic_t hid_write_errors;
+static atomic_t last_keyboard_packet_ms;
+static atomic_t keyboard_watchdog_released;
 
 /*
  * The ESB event handler runs in interrupt context. It may use a message queue
  * with K_NO_WAIT, but it must not call the USB HID endpoint API directly.
  */
-static void queue_hid_report(const struct link_input_packet *packet)
+static bool queue_hid_report(const struct link_input_packet *packet)
 {
 	if (k_msgq_put(&hid_report_queue, packet, K_NO_WAIT) == 0) {
-		return;
+		return true;
 	}
 
 	/*
 	 * HID keyboard packets describe the complete current key state. If the
-	 * consumer falls behind, discard the oldest state and retain the newest
-	 * one so that a key-release report cannot remain stuck indefinitely.
+	 * consumer falls behind, purge stale transitions before retaining the
+	 * newest keyboard state. A release must never be evicted by an older
+	 * keyboard or Consumer Control transition.
 	 */
 	struct link_input_packet discarded;
 
 	atomic_inc(&hid_queue_overruns);
-	if (k_msgq_get(&hid_report_queue, &discarded, K_NO_WAIT) == 0) {
-		(void)k_msgq_put(&hid_report_queue, packet, K_NO_WAIT);
+	if (packet->type == LINK_TYPE_KEYBOARD) {
+		k_msgq_purge(&hid_report_queue);
+		return k_msgq_put(&hid_report_queue, packet, K_NO_WAIT) == 0;
 	}
+	if (k_msgq_get(&hid_report_queue, &discarded, K_NO_WAIT) == 0) {
+		return k_msgq_put(&hid_report_queue, packet, K_NO_WAIT) == 0;
+	}
+	return false;
 }
 
 static void receiver_esb_event_handler(const struct esb_evt *event)
 {
-	static bool previous_packet_valid;
-	static uint8_t previous_type;
-	static uint8_t previous_data[INPUT_DATA_SIZE];
+	static bool previous_keyboard_valid;
+	static bool previous_consumer_valid;
+	static uint8_t previous_keyboard[INPUT_DATA_SIZE];
+	static uint8_t previous_consumer[INPUT_DATA_SIZE];
 
 	if (event->evt_id != ESB_EVENT_RX_RECEIVED) {
 		return;
@@ -171,21 +182,36 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			continue;
 		}
 
+		if (packet.type == LINK_TYPE_KEYBOARD) {
+			atomic_set(&last_keyboard_packet_ms, k_uptime_get_32());
+		}
+
+		bool *previous_valid = packet.type == LINK_TYPE_KEYBOARD ?
+			&previous_keyboard_valid : &previous_consumer_valid;
+		uint8_t *previous_data = packet.type == LINK_TYPE_KEYBOARD ?
+			previous_keyboard : previous_consumer;
+		bool const watchdog_needs_state =
+			packet.type == LINK_TYPE_KEYBOARD &&
+			atomic_get(&keyboard_watchdog_released) != 0;
+
 		/*
 		 * Reports are complete states. Keepalives and RF retries do not
 		 * need to enter the HID transition queue when the state is equal.
 		 */
-		if (previous_packet_valid && packet.type == previous_type &&
+		if (*previous_valid && !watchdog_needs_state &&
 		    memcmp(packet.data, previous_data,
-			   sizeof(previous_data)) == 0) {
+			   INPUT_DATA_SIZE) == 0) {
 			atomic_inc(&radio_duplicates);
 			continue;
 		}
 
-		previous_packet_valid = true;
-		previous_type = packet.type;
-		memcpy(previous_data, packet.data, sizeof(previous_data));
-		queue_hid_report(&packet);
+		if (queue_hid_report(&packet)) {
+			*previous_valid = true;
+			memcpy(previous_data, packet.data, INPUT_DATA_SIZE);
+			if (packet.type == LINK_TYPE_KEYBOARD) {
+				atomic_set(&keyboard_watchdog_released, 0);
+			}
+		}
 	}
 }
 
@@ -304,7 +330,11 @@ static int send_hid_report(const uint8_t *report, size_t report_size)
 	 * Serialize endpoint writes. The USB callback also releases this wait
 	 * on disconnect/suspend, preventing the bridge thread from hanging.
 	 */
-	k_sem_take(&hid_in_done, K_FOREVER);
+	err = k_sem_take(&hid_in_done, K_MSEC(HID_WRITE_TIMEOUT_MS));
+	if (err != 0) {
+		atomic_inc(&hid_write_errors);
+		return -ETIMEDOUT;
+	}
 	if (!usb_hid_ready()) {
 		return -ENOTCONN;
 	}
@@ -353,6 +383,7 @@ static int usb_hid_initialize(void)
 	return usb_enable(usb_status_callback);
 }
 
+#if CONFIG_LOG
 static void status_thread(void)
 {
 	for (;;) {
@@ -382,6 +413,14 @@ static void status_thread(void)
 
 K_THREAD_DEFINE(status_thread_id, 1024, status_thread,
 		NULL, NULL, NULL, 7, 0, 0);
+#endif
+
+static bool keyboard_data_is_released(const uint8_t data[INPUT_DATA_SIZE])
+{
+	static const uint8_t released[INPUT_DATA_SIZE] = { 0 };
+
+	return memcmp(data, released, sizeof(released)) == 0;
+}
 
 int main(void)
 {
@@ -392,7 +431,7 @@ int main(void)
 
 	/*
 	 * Enumerate USB first. A radio initialization failure must never make
-	 * the HID/CDC composite device disappear from the host.
+	 * the HID device disappear from the host.
 	 */
 	err = usb_hid_initialize();
 	if (err != 0) {
@@ -427,6 +466,16 @@ int main(void)
 				}
 			}
 			k_msleep(1);
+			continue;
+		}
+
+		if (!keyboard_data_is_released(current_keyboard) &&
+		    (uint32_t)(k_uptime_get_32() -
+		    (uint32_t)atomic_get(&last_keyboard_packet_ms)) >=
+		    KEYBOARD_LINK_TIMEOUT_MS) {
+			memset(current_keyboard, 0, sizeof(current_keyboard));
+			atomic_set(&keyboard_watchdog_released, 1);
+			(void)send_keyboard_report(current_keyboard);
 			continue;
 		}
 
