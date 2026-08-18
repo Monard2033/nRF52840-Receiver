@@ -38,7 +38,7 @@ LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 #define HID_REPORT_ID_CONSUMER 0x02U
 #define HID_REPORT_ID_BATTERY  0x03U
 #define HID_REPORT_ID_DFU      0x04U
-#define KEYBOARD_LINK_TIMEOUT_MS 250U
+#define KEYBOARD_LINK_TIMEOUT_MS 2000U
 #define KEYBOARD_KEEPALIVE_MS    8U
 #define HID_FEATURE_PAYLOAD_LEN 8U
 #define HID_FEATURE_REPORT_LEN  (1U + HID_FEATURE_PAYLOAD_LEN)
@@ -405,32 +405,26 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			previous_keyboard : previous_consumer;
 		uint8_t *previous_sequence = packet.type == LINK_TYPE_KEYBOARD ?
 			&previous_keyboard_sequence : &previous_consumer_sequence;
-		bool const watchdog_needs_state =
-			packet.type == LINK_TYPE_KEYBOARD &&
-			atomic_get(&keyboard_watchdog_released) != 0;
 		bool const sequence_newer = !*previous_valid ||
 			sequence_is_newer(packet.sequence, *previous_sequence);
 		bool const same_sequence_retry = *previous_valid &&
 			packet.sequence == *previous_sequence && *previous_queue_failed;
 
 		/*
-		 * Keyboard packets are absolute states, so an equal state is a
-		 * keepalive even when it has a newer sequence. Consumer packets are
-		 * transitions: a newer sequence must be queued even when its payload
-		 * happens to equal an earlier press or release. Retransmissions reuse
-		 * the same sequence and are discarded only after the first queue put
-		 * succeeded.
+		 * Keyboard packets are absolute states: if the data is identical to
+		 * the current keyboard state, it is a keepalive/duplicate, so drop it
+		 * and do NOT re-queue it to Windows.
 		 */
-		if (*previous_valid && !watchdog_needs_state &&
-		    !sequence_newer && !same_sequence_retry) {
-			atomic_inc(&radio_duplicates);
-			continue;
-		}
-		if (packet.type == LINK_TYPE_KEYBOARD && *previous_valid &&
-		    sequence_newer && !watchdog_needs_state &&
+		if (*previous_valid && !same_sequence_retry &&
+		    packet.type == LINK_TYPE_KEYBOARD &&
 		    memcmp(packet.data, previous_data, INPUT_DATA_SIZE) == 0) {
 			*previous_sequence = packet.sequence;
 			*previous_queue_failed = false;
+			atomic_inc(&radio_duplicates);
+			continue;
+		}
+
+		if (*previous_valid && !sequence_newer && !same_sequence_retry) {
 			atomic_inc(&radio_duplicates);
 			continue;
 		}
