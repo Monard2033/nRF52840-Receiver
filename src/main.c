@@ -40,6 +40,7 @@ LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 #define KEYBOARD_LINK_TIMEOUT_MS 250U
 #define KEYBOARD_KEEPALIVE_MS    8U
 #define HID_FEATURE_PAYLOAD_LEN 8U
+#define HID_FEATURE_REPORT_LEN  (1U + HID_FEATURE_PAYLOAD_LEN)
 
 /*
  * This is the on-air packet shared with the transmitter. ESB already adds a
@@ -241,6 +242,10 @@ static void receiver_set_led_state(uint8_t led_state)
 	}
 	windows_led_valid = true;
 	k_spin_unlock(&led_state_lock, key);
+
+	/* Queue the new Windows state immediately. It will be attached to the
+	 * next eligible ESB ACK without waiting for another RX handler cycle. */
+	atomic_set(&led_ack_pending, 1);
 }
 
 static bool receiver_queue_led_ack(void)
@@ -446,24 +451,26 @@ static int esb_initialize(void)
 }
 
 static uint8_t hid_tx_buffer[1U + INPUT_DATA_SIZE];
-static uint8_t battery_feature_report[HID_FEATURE_PAYLOAD_LEN];
+static uint8_t battery_feature_report[HID_FEATURE_REPORT_LEN];
 
-static void battery_feature_build(uint8_t report[HID_FEATURE_PAYLOAD_LEN])
+static void battery_feature_build(uint8_t report[HID_FEATURE_REPORT_LEN])
 {
+	uint8_t *const payload = &report[1];
 	k_spinlock_key_t key = k_spin_lock(&battery_cache_lock);
 	uint32_t const age_ms = battery_cache_valid ?
 		(k_uptime_get_32() - battery_last_update_ms) : UINT32_MAX;
 	uint32_t const age_seconds = age_ms == UINT32_MAX ? 0xFFFFU :
 		MIN(age_ms / 1000U, 0xFFFFU);
 
-	report[0] = battery_percentage;
-	report[1] = battery_state;
-	report[2] = (uint8_t)battery_millivolts;
-	report[3] = (uint8_t)(battery_millivolts >> 8);
-	report[4] = battery_sequence;
-	report[5] = battery_cache_valid ? battery_flags : 0U;
-	report[6] = (uint8_t)age_seconds;
-	report[7] = (uint8_t)(age_seconds >> 8);
+	report[0] = HID_REPORT_ID_BATTERY;
+	payload[0] = battery_percentage;
+	payload[1] = battery_state;
+	payload[2] = (uint8_t)battery_millivolts;
+	payload[3] = (uint8_t)(battery_millivolts >> 8);
+	payload[4] = battery_sequence;
+	payload[5] = battery_cache_valid ? battery_flags : 0U;
+	payload[6] = (uint8_t)age_seconds;
+	payload[7] = (uint8_t)(age_seconds >> 8);
 	k_spin_unlock(&battery_cache_lock, key);
 }
 
@@ -496,7 +503,16 @@ static int hid_set_report(const struct device *dev,
 		return -ENOTSUP;
 	}
 
-	receiver_set_led_state((*data)[0]);
+	uint8_t const *const report = *data;
+	if (*len >= 2 && report[0] == HID_REPORT_ID_KEYBOARD) {
+		receiver_set_led_state(report[1]);
+	} else if (*len == 1) {
+		/* Some hosts omit the ID from the data stage because it is already
+		 * present in wValue. Keep that legal control-transfer form working. */
+		receiver_set_led_state(report[0]);
+	} else {
+		return -EINVAL;
+	}
 	return 0;
 }
 
