@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Wireless keyboard receiver:
- *   ESB PRX -> validated keyboard state -> USB boot-keyboard HID report.
+ *   ESB PRX -> validated keyboard/consumer input -> USB HID reports.
  */
 
 #include <errno.h>
@@ -22,36 +22,125 @@
 
 LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 
-#define KEYBOARD_REPORT_SIZE   8U
+#define INPUT_DATA_SIZE        8U
 #define LINK_MAGIC             0xA5U
-#define LINK_VERSION           0x01U
+#define LINK_VERSION           0x03U
 #define LINK_TYPE_KEYBOARD     0x01U
+#define LINK_TYPE_CONSUMER     0x02U
+#define LINK_TYPE_CONTROL      0x03U
+#define LINK_TYPE_BATTERY      0x04U
+#define LINK_CONTROL_POLL_ACK  0x02U
+#define LINK_ACK_MAGIC         0x5AU
+#define LINK_ACK_TYPE_LOCK_STATE 0x01U
 #define LINK_RF_CHANNEL        80U
-#define HID_QUEUE_DEPTH        32U
+#define HID_QUEUE_DEPTH        128U
+#define HID_REPORT_ID_KEYBOARD 0x01U
+#define HID_REPORT_ID_CONSUMER 0x02U
+#define HID_REPORT_ID_BATTERY  0x03U
+#define KEYBOARD_LINK_TIMEOUT_MS 250U
+#define KEYBOARD_KEEPALIVE_MS    8U
+#define HID_FEATURE_PAYLOAD_LEN 8U
+#define HID_FEATURE_REPORT_LEN  (1U + HID_FEATURE_PAYLOAD_LEN)
 
 /*
  * This is the on-air packet shared with the transmitter. ESB already adds a
  * CRC, acknowledgement, and retransmissions, so no application CRC is needed.
  */
-struct link_keyboard_packet {
+struct link_input_packet {
 	uint8_t magic;
 	uint8_t version;
 	uint8_t type;
 	uint8_t sequence;
-	uint8_t report[KEYBOARD_REPORT_SIZE];
+	uint8_t data[INPUT_DATA_SIZE];
 } __packed;
 
-struct keyboard_report {
-	uint8_t data[KEYBOARD_REPORT_SIZE];
-};
+BUILD_ASSERT(sizeof(struct link_input_packet) == 12U);
 
-BUILD_ASSERT(sizeof(struct link_keyboard_packet) == 12U);
+struct link_ack_frame {
+	uint8_t magic;
+	uint8_t version;
+	uint8_t type;
+	uint8_t sequence;
+	uint8_t data[INPUT_DATA_SIZE];
+} __packed;
 
-K_MSGQ_DEFINE(hid_report_queue, sizeof(struct keyboard_report),
+BUILD_ASSERT(sizeof(struct link_ack_frame) == 12U);
+
+K_MSGQ_DEFINE(hid_report_queue, sizeof(struct link_input_packet),
 	      HID_QUEUE_DEPTH, sizeof(uint32_t));
-static K_SEM_DEFINE(hid_in_done, 0, 1);
+static K_SEM_DEFINE(hid_in_idle, 1, 1);
 
-static const uint8_t hid_report_descriptor[] = HID_KEYBOARD_REPORT_DESC();
+/*
+ * Report ID 1 is the normal 8-byte keyboard state. Report ID 2 is one
+ * 16-bit Consumer Page usage (Play/Pause, volume, media navigation, etc.).
+ */
+static const uint8_t hid_report_descriptor[] = {
+	0x05, 0x01,       /* Usage Page (Generic Desktop) */
+	0x09, 0x06,       /* Usage (Keyboard) */
+	0xA1, 0x01,       /* Collection (Application) */
+	0x85, HID_REPORT_ID_KEYBOARD,
+	0x05, 0x07,       /* Usage Page (Keyboard) */
+	0x19, 0xE0,       /* Usage Minimum (Left Control) */
+	0x29, 0xE7,       /* Usage Maximum (Right GUI) */
+	0x15, 0x00,
+	0x25, 0x01,
+	0x75, 0x01,
+	0x95, 0x08,
+	0x81, 0x02,       /* Input (Data, Variable, Absolute) */
+	0x75, 0x08,
+	0x95, 0x01,
+	0x81, 0x03,       /* Input (Constant) */
+	0x05, 0x08,       /* Usage Page (LEDs) */
+	0x19, 0x01,
+	0x29, 0x05,
+	0x75, 0x01,
+	0x95, 0x05,
+	0x91, 0x02,       /* Output (Data, Variable, Absolute) */
+	0x75, 0x03,
+	0x95, 0x01,
+	0x91, 0x03,       /* Output (Constant) */
+	0x05, 0x07,
+	0x19, 0x00,
+	0x29, 0x65,
+	0x15, 0x00,
+	0x25, 0x65,
+	0x75, 0x08,
+	0x95, 0x06,
+	0x81, 0x00,       /* Input (Data, Array) */
+	0xC0,
+
+	0x05, 0x0C,       /* Usage Page (Consumer) */
+	0x09, 0x01,       /* Usage (Consumer Control) */
+	0xA1, 0x01,
+	0x85, HID_REPORT_ID_CONSUMER,
+	0x15, 0x00,
+	0x26, 0xFF, 0x03,
+	0x1A, 0x00, 0x00,
+	0x2A, 0xFF, 0x03,
+	0x75, 0x10,
+	0x95, 0x01,
+	0x81, 0x00,       /* Input (Data, Array, Absolute) */
+	0xC0,
+
+	/* Vendor-defined cached battery Feature/Input report (ID 3). */
+	0x06, 0x00, 0xFF,
+	0x09, 0x01,
+	0xA1, 0x01,
+	0x85, HID_REPORT_ID_BATTERY,
+	0x15, 0x00,
+	0x26, 0xFF, 0x00,
+	0x75, 0x08,
+	0x95, HID_FEATURE_PAYLOAD_LEN,
+	0x19, 0x01,       /* Usage Minimum (vendor byte 1) */
+	0x29, HID_FEATURE_PAYLOAD_LEN,
+	0x81, 0x02,
+	/* Local Usage items are cleared after each Main item. Repeat the range
+	 * for the Feature fields so Windows can validate all eight variables. */
+	0x19, 0x01,
+	0x29, HID_FEATURE_PAYLOAD_LEN,
+	0xB1, 0x02,
+	0xC0,
+};
 static const struct device *hid_device;
 static atomic_t usb_configured;
 static atomic_t usb_suspended;
@@ -68,45 +157,148 @@ static atomic_t radio_init_error;
 static atomic_t hid_queue_overruns;
 static atomic_t hid_reports_sent;
 static atomic_t hid_write_errors;
+static atomic_t last_keyboard_packet_ms;
+static atomic_t keyboard_watchdog_released;
+
+static struct k_spinlock led_state_lock;
+static uint8_t windows_led_state;
+static uint8_t windows_led_sequence;
+static uint8_t windows_led_epoch;
+static bool windows_led_valid;
+static atomic_t led_ack_pending;
+
+static struct k_spinlock battery_cache_lock;
+static uint8_t battery_percentage;
+static uint8_t battery_state;
+static uint16_t battery_millivolts;
+static uint8_t battery_sequence;
+static uint8_t battery_flags;
+static uint32_t battery_last_update_ms;
+static bool battery_cache_valid;
 
 /*
  * The ESB event handler runs in interrupt context. It may use a message queue
  * with K_NO_WAIT, but it must not call the USB HID endpoint API directly.
  */
-static void queue_hid_report(const uint8_t report[KEYBOARD_REPORT_SIZE])
+static bool queue_hid_report(const struct link_input_packet *packet)
 {
-	struct keyboard_report item;
-
-	memcpy(item.data, report, sizeof(item.data));
-	if (k_msgq_put(&hid_report_queue, &item, K_NO_WAIT) == 0) {
-		return;
+	if (k_msgq_put(&hid_report_queue, packet, K_NO_WAIT) == 0) {
+		return true;
 	}
 
-	/*
-	 * HID keyboard packets describe the complete current key state. If the
-	 * consumer falls behind, discard the oldest state and retain the newest
-	 * one so that a key-release report cannot remain stuck indefinitely.
-	 */
-	struct keyboard_report discarded;
+	/* The normal path has enough room for more than 100 ms of 1 kHz input.
+	 * If an external USB stall lasts longer than that, discard only the oldest
+	 * frame; never purge the queue because that would destroy an ordered
+	 * modifier/key/release sequence such as CTRL+C. */
+	struct link_input_packet discarded;
 
 	atomic_inc(&hid_queue_overruns);
 	if (k_msgq_get(&hid_report_queue, &discarded, K_NO_WAIT) == 0) {
-		(void)k_msgq_put(&hid_report_queue, &item, K_NO_WAIT);
+		return k_msgq_put(&hid_report_queue, packet, K_NO_WAIT) == 0;
+	}
+	return false;
+}
+
+static bool sequence_is_newer(uint8_t sequence, uint8_t previous)
+{
+	return (int8_t)(sequence - previous) > 0;
+}
+
+static bool battery_packet_is_valid(const struct link_input_packet *packet)
+{
+	return packet->data[0] <= 100U && packet->data[1] <= 4U &&
+	       (packet->data[5] & 0x01U) != 0U &&
+	       (packet->data[5] & 0xF0U) == 0U &&
+	       packet->data[6] == 0U && packet->data[7] == 0U;
+}
+
+static void battery_cache_update(const struct link_input_packet *packet)
+{
+	k_spinlock_key_t key = k_spin_lock(&battery_cache_lock);
+	bool const newer = !battery_cache_valid ||
+		sequence_is_newer(packet->data[4], battery_sequence);
+
+	if (newer) {
+		battery_percentage = packet->data[0];
+		battery_state = packet->data[1];
+		battery_millivolts = (uint16_t)packet->data[2] |
+			((uint16_t)packet->data[3] << 8);
+		battery_sequence = packet->data[4];
+		battery_flags = packet->data[5];
+		battery_last_update_ms = k_uptime_get_32();
+		battery_cache_valid = true;
+	}
+	k_spin_unlock(&battery_cache_lock, key);
+}
+
+static void receiver_set_led_state(uint8_t led_state)
+{
+	led_state &= 0x07U;
+	k_spinlock_key_t key = k_spin_lock(&led_state_lock);
+
+	if (!windows_led_valid || windows_led_state != led_state) {
+		windows_led_state = led_state;
+		windows_led_sequence++;
+	}
+	windows_led_valid = true;
+	k_spin_unlock(&led_state_lock, key);
+
+	/* Queue the new Windows state immediately. It will be attached to the
+	 * next eligible ESB ACK without waiting for another RX handler cycle. */
+	atomic_set(&led_ack_pending, 1);
+}
+
+static bool receiver_queue_led_ack(void)
+{
+	struct link_ack_frame ack = {
+		.magic = LINK_ACK_MAGIC,
+		.version = LINK_VERSION,
+		.type = LINK_ACK_TYPE_LOCK_STATE,
+	};
+	struct esb_payload payload = { 0 };
+
+	k_spinlock_key_t key = k_spin_lock(&led_state_lock);
+	ack.sequence = windows_led_sequence;
+	ack.data[0] = windows_led_state;
+	ack.data[1] = windows_led_valid ? 0x01U : 0x00U;
+	ack.data[2] = windows_led_epoch;
+	k_spin_unlock(&led_state_lock, key);
+
+	payload.length = sizeof(ack);
+	payload.pipe = 0;
+	payload.noack = false;
+	memcpy(payload.data, &ack, sizeof(ack));
+	return esb_write_payload(&payload) == 0;
+}
+
+static void receiver_ack_task(void)
+{
+	/* esb_write_payload() changes the ESB ACK queue and must not run from the
+	 * ESB event IRQ. Collapse repeated packets to one latest-state ACK. */
+	if (atomic_cas(&led_ack_pending, 1, 0) &&
+	    !receiver_queue_led_ack()) {
+		atomic_set(&led_ack_pending, 1);
 	}
 }
 
 static void receiver_esb_event_handler(const struct esb_evt *event)
 {
-	static bool previous_packet_valid;
-	static uint8_t previous_sequence;
-	static uint8_t previous_report[KEYBOARD_REPORT_SIZE];
+	static bool previous_keyboard_valid;
+	static bool previous_consumer_valid;
+	static bool previous_keyboard_queue_failed;
+	static bool previous_consumer_queue_failed;
+	static uint8_t previous_keyboard[INPUT_DATA_SIZE];
+	static uint8_t previous_consumer[INPUT_DATA_SIZE];
+	static uint8_t previous_keyboard_sequence;
+	static uint8_t previous_consumer_sequence;
+	bool ack_needed = false;
 
 	if (event->evt_id != ESB_EVENT_RX_RECEIVED) {
 		return;
 	}
 
 	while (esb_read_rx_payload(&esb_rx_payload) == 0) {
-		struct link_keyboard_packet packet;
+		struct link_input_packet packet;
 
 		atomic_inc(&radio_packets);
 		atomic_set(&radio_last_rssi, esb_rx_payload.rssi);
@@ -118,24 +310,93 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 		memcpy(&packet, esb_rx_payload.data, sizeof(packet));
 		if (packet.magic != LINK_MAGIC ||
 		    packet.version != LINK_VERSION ||
-		    packet.type != LINK_TYPE_KEYBOARD) {
+		    (packet.type != LINK_TYPE_KEYBOARD &&
+		     packet.type != LINK_TYPE_CONSUMER &&
+		     packet.type != LINK_TYPE_CONTROL &&
+		     packet.type != LINK_TYPE_BATTERY)) {
 			atomic_inc(&radio_bad_packets);
 			continue;
 		}
+		if (packet.type == LINK_TYPE_BATTERY) {
+			if (!battery_packet_is_valid(&packet)) {
+				atomic_inc(&radio_bad_packets);
+				continue;
+			}
+			ack_needed = true;
+			battery_cache_update(&packet);
+			continue;
+		}
 
-		/* An application retry uses the same sequence and report. */
-		if (previous_packet_valid &&
-		    packet.sequence == previous_sequence &&
-		    memcmp(packet.report, previous_report,
-			   sizeof(previous_report)) == 0) {
+		if (packet.type == LINK_TYPE_CONTROL) {
+			if (packet.data[0] != LINK_CONTROL_POLL_ACK) {
+				atomic_inc(&radio_bad_packets);
+				continue;
+			}
+			ack_needed = true;
+			continue;
+		}
+
+		ack_needed = true;
+
+		if (packet.type == LINK_TYPE_KEYBOARD) {
+			atomic_set(&last_keyboard_packet_ms, k_uptime_get_32());
+		}
+
+		bool *previous_valid = packet.type == LINK_TYPE_KEYBOARD ?
+			&previous_keyboard_valid : &previous_consumer_valid;
+		bool *previous_queue_failed = packet.type == LINK_TYPE_KEYBOARD ?
+			&previous_keyboard_queue_failed : &previous_consumer_queue_failed;
+		uint8_t *previous_data = packet.type == LINK_TYPE_KEYBOARD ?
+			previous_keyboard : previous_consumer;
+		uint8_t *previous_sequence = packet.type == LINK_TYPE_KEYBOARD ?
+			&previous_keyboard_sequence : &previous_consumer_sequence;
+		bool const watchdog_needs_state =
+			packet.type == LINK_TYPE_KEYBOARD &&
+			atomic_get(&keyboard_watchdog_released) != 0;
+		bool const sequence_newer = !*previous_valid ||
+			sequence_is_newer(packet.sequence, *previous_sequence);
+		bool const same_sequence_retry = *previous_valid &&
+			packet.sequence == *previous_sequence && *previous_queue_failed;
+
+		/*
+		 * Keyboard packets are absolute states, so an equal state is a
+		 * keepalive even when it has a newer sequence. Consumer packets are
+		 * transitions: a newer sequence must be queued even when its payload
+		 * happens to equal an earlier press or release. Retransmissions reuse
+		 * the same sequence and are discarded only after the first queue put
+		 * succeeded.
+		 */
+		if (*previous_valid && !watchdog_needs_state &&
+		    !sequence_newer && !same_sequence_retry) {
+			atomic_inc(&radio_duplicates);
+			continue;
+		}
+		if (packet.type == LINK_TYPE_KEYBOARD && *previous_valid &&
+		    sequence_newer && !watchdog_needs_state &&
+		    memcmp(packet.data, previous_data, INPUT_DATA_SIZE) == 0) {
+			*previous_sequence = packet.sequence;
+			*previous_queue_failed = false;
 			atomic_inc(&radio_duplicates);
 			continue;
 		}
 
-		previous_packet_valid = true;
-		previous_sequence = packet.sequence;
-		memcpy(previous_report, packet.report, sizeof(previous_report));
-		queue_hid_report(packet.report);
+		if (queue_hid_report(&packet)) {
+			*previous_valid = true;
+			*previous_sequence = packet.sequence;
+			*previous_queue_failed = false;
+			memcpy(previous_data, packet.data, INPUT_DATA_SIZE);
+			if (packet.type == LINK_TYPE_KEYBOARD) {
+				atomic_set(&keyboard_watchdog_released, 0);
+			}
+		} else {
+			*previous_valid = true;
+			*previous_sequence = packet.sequence;
+			*previous_queue_failed = true;
+		}
+	}
+
+	if (ack_needed) {
+		atomic_set(&led_ack_pending, 1);
 	}
 }
 
@@ -154,10 +415,11 @@ static int esb_initialize(void)
 
 	esb_config.protocol = ESB_PROTOCOL_ESB_DPL;
 	esb_config.mode = ESB_MODE_PRX;
-	esb_config.bitrate = ESB_BITRATE_1MBPS;
+	esb_config.bitrate = ESB_BITRATE_2MBPS;
 	esb_config.tx_output_power = ESB_TX_POWER_8DBM;
-	esb_config.payload_length = sizeof(struct link_keyboard_packet);
+	esb_config.payload_length = sizeof(struct link_input_packet);
 	esb_config.selective_auto_ack = true;
+	esb_config.use_fast_ramp_up = true;
 	esb_config.event_handler = receiver_esb_event_handler;
 
 	err = esb_init(&esb_config);
@@ -188,14 +450,103 @@ static int esb_initialize(void)
 	return esb_start_rx();
 }
 
+static uint8_t hid_tx_buffer[1U + INPUT_DATA_SIZE];
+static uint8_t battery_feature_report[HID_FEATURE_REPORT_LEN];
+
+static void battery_feature_build(uint8_t report[HID_FEATURE_REPORT_LEN])
+{
+	uint8_t *const payload = &report[1];
+	k_spinlock_key_t key = k_spin_lock(&battery_cache_lock);
+	uint32_t const age_ms = battery_cache_valid ?
+		(k_uptime_get_32() - battery_last_update_ms) : UINT32_MAX;
+	uint32_t const age_seconds = age_ms == UINT32_MAX ? 0xFFFFU :
+		MIN(age_ms / 1000U, 0xFFFFU);
+
+	report[0] = HID_REPORT_ID_BATTERY;
+	payload[0] = battery_percentage;
+	payload[1] = battery_state;
+	payload[2] = (uint8_t)battery_millivolts;
+	payload[3] = (uint8_t)(battery_millivolts >> 8);
+	payload[4] = battery_sequence;
+	payload[5] = battery_cache_valid ? battery_flags : 0U;
+	payload[6] = (uint8_t)age_seconds;
+	payload[7] = (uint8_t)(age_seconds >> 8);
+	k_spin_unlock(&battery_cache_lock, key);
+}
+
+static int hid_get_report(const struct device *dev,
+				  struct usb_setup_packet *setup,
+				  int32_t *len, uint8_t **data)
+{
+	ARG_UNUSED(dev);
+
+	if ((setup->wValue >> 8) != 3U ||
+	    (setup->wValue & 0xFFU) != HID_REPORT_ID_BATTERY) {
+		return -ENOTSUP;
+	}
+
+	battery_feature_build(battery_feature_report);
+	*data = battery_feature_report;
+	*len = sizeof(battery_feature_report);
+	return 0;
+}
+
+static int hid_set_report(const struct device *dev,
+				  struct usb_setup_packet *setup,
+				  int32_t *len, uint8_t **data)
+{
+	ARG_UNUSED(dev);
+
+	if ((setup->wValue >> 8) != 2U ||
+	    (setup->wValue & 0xFFU) != HID_REPORT_ID_KEYBOARD ||
+	    *len < 1 || *data == NULL) {
+		return -ENOTSUP;
+	}
+
+	uint8_t const *const report = *data;
+	if (*len >= 2 && report[0] == HID_REPORT_ID_KEYBOARD) {
+		receiver_set_led_state(report[1]);
+	} else if (*len == 1) {
+		/* Some hosts omit the ID from the data stage because it is already
+		 * present in wValue. Keep that legal control-transfer form working. */
+		receiver_set_led_state(report[0]);
+	} else {
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static void hid_int_in_ready(const struct device *dev)
 {
 	ARG_UNUSED(dev);
-	k_sem_give(&hid_in_done);
+	k_sem_give(&hid_in_idle);
+}
+
+static void hid_int_out_ready(const struct device *dev)
+{
+	uint8_t report[INPUT_DATA_SIZE] = { 0 };
+	uint32_t report_len = 0;
+
+	if (hid_int_ep_read(dev, report, sizeof(report), &report_len) != 0 ||
+	    report_len == 0) {
+		return;
+	}
+
+	/* Report protocol carries ID 1; boot protocol sends the one-byte LED
+	 * payload without a report ID. Use the length to disambiguate LED bit 0x01
+	 * from report ID 1. */
+	uint32_t const offset = report_len >= 2U &&
+		report[0] == HID_REPORT_ID_KEYBOARD ? 1U : 0U;
+	if (report_len > offset) {
+		receiver_set_led_state(report[offset]);
+	}
 }
 
 static const struct hid_ops hid_ops = {
+	.get_report = hid_get_report,
+	.set_report = hid_set_report,
 	.int_in_ready = hid_int_in_ready,
+	.int_out_ready = hid_int_out_ready,
 };
 
 static void usb_status_callback(enum usb_dc_status_code status,
@@ -211,7 +562,8 @@ static void usb_status_callback(enum usb_dc_status_code status,
 	case USB_DC_SUSPEND:
 		atomic_set(&usb_suspended, 1);
 		/* Release a sender if the host suspends with an IN pending. */
-		k_sem_give(&hid_in_done);
+		k_sem_reset(&hid_in_idle);
+		k_sem_give(&hid_in_idle);
 		break;
 	case USB_DC_RESUME:
 		atomic_set(&usb_suspended, 0);
@@ -221,7 +573,8 @@ static void usb_status_callback(enum usb_dc_status_code status,
 		atomic_set(&usb_configured, 0);
 		atomic_set(&usb_suspended, 0);
 		/* Release a sender if the endpoint disappeared. */
-		k_sem_give(&hid_in_done);
+		k_sem_reset(&hid_in_idle);
+		k_sem_give(&hid_in_idle);
 		break;
 	default:
 		break;
@@ -234,33 +587,49 @@ static bool usb_hid_ready(void)
 	       atomic_get(&usb_suspended) == 0;
 }
 
-static int send_hid_report(const struct keyboard_report *report)
+static int send_hid_report(const uint8_t *report, size_t report_size)
 {
-	int err;
-
 	if (!usb_hid_ready()) {
 		return -ENOTCONN;
 	}
+	if (report_size > sizeof(hid_tx_buffer)) {
+		return -EMSGSIZE;
+	}
+	if (k_sem_take(&hid_in_idle, K_NO_WAIT) != 0) {
+		return -EBUSY;
+	}
 
-	k_sem_reset(&hid_in_done);
-	err = hid_int_ep_write(hid_device, report->data, sizeof(report->data),
-			       NULL);
+	memcpy(hid_tx_buffer, report, report_size);
+	int const err = hid_int_ep_write(hid_device, hid_tx_buffer,
+					 report_size, NULL);
 	if (err != 0) {
+		k_sem_give(&hid_in_idle);
 		atomic_inc(&hid_write_errors);
 		return err;
 	}
 
-	/*
-	 * Serialize endpoint writes. The USB callback also releases this wait
-	 * on disconnect/suspend, preventing the bridge thread from hanging.
-	 */
-	k_sem_take(&hid_in_done, K_FOREVER);
-	if (!usb_hid_ready()) {
-		return -ENOTCONN;
-	}
-
 	atomic_inc(&hid_reports_sent);
 	return 0;
+}
+
+static int send_keyboard_report(const uint8_t data[INPUT_DATA_SIZE])
+{
+	uint8_t report[1U + INPUT_DATA_SIZE];
+
+	report[0] = HID_REPORT_ID_KEYBOARD;
+	memcpy(&report[1], data, INPUT_DATA_SIZE);
+	return send_hid_report(report, sizeof(report));
+}
+
+static int send_consumer_report(const uint8_t data[INPUT_DATA_SIZE])
+{
+	const uint8_t report[] = {
+		HID_REPORT_ID_CONSUMER,
+		data[0],
+		data[1],
+	};
+
+	return send_hid_report(report, sizeof(report));
 }
 
 static int usb_hid_initialize(void)
@@ -283,6 +652,7 @@ static int usb_hid_initialize(void)
 	return usb_enable(usb_status_callback);
 }
 
+#if CONFIG_LOG
 static void status_thread(void)
 {
 	for (;;) {
@@ -312,17 +682,29 @@ static void status_thread(void)
 
 K_THREAD_DEFINE(status_thread_id, 1024, status_thread,
 		NULL, NULL, NULL, 7, 0, 0);
+#endif
+
+static bool keyboard_data_is_released(const uint8_t data[INPUT_DATA_SIZE])
+{
+	static const uint8_t released[INPUT_DATA_SIZE] = { 0 };
+
+	return memcmp(data, released, sizeof(released)) == 0;
+}
 
 int main(void)
 {
-	struct keyboard_report current = { 0 };
+	uint8_t current_keyboard[INPUT_DATA_SIZE] = { 0 };
+	struct link_input_packet hid_pending = { 0 };
+	bool hid_pending_valid = false;
+	uint32_t next_keyboard_keepalive_ms = 0;
 	int err;
 
-	LOG_INF("Starting ESB-to-USB keyboard receiver");
+	LOG_INF("Starting ESB-to-USB keyboard and consumer-control receiver");
+	windows_led_epoch = (uint8_t)k_cycle_get_32();
 
 	/*
 	 * Enumerate USB first. A radio initialization failure must never make
-	 * the HID/CDC composite device disappear from the host.
+	 * the HID device disappear from the host.
 	 */
 	err = usb_hid_initialize();
 	if (err != 0) {
@@ -336,42 +718,69 @@ int main(void)
 		LOG_ERR("ESB initialization failed: %d; USB remains available", err);
 	} else {
 		atomic_set(&radio_ready, 1);
-		LOG_INF("Ready: ESB PRX channel %u, pipe 0 address E7:E7E7E7E7, "
-			"USB boot keyboard", LINK_RF_CHANNEL);
+		LOG_INF("Ready: ESB PRX 2 Mbps channel %u, pipe 0 address "
+			"E7:E7E7E7E7, USB keyboard + Consumer Control",
+			LINK_RF_CHANNEL);
 	}
 
 	for (;;) {
+		struct link_input_packet queued;
+		uint32_t const now = k_uptime_get_32();
+
+		receiver_ack_task();
+
 		if (!usb_hid_ready()) {
 			/*
-			 * Keep only the most recent wireless state while the PC is
-			 * absent. On enumeration, that state is sent immediately.
+			 * Retain only keyboard state while the PC is absent. Consumer
+			 * actions are transitions and must not be replayed later.
 			 */
-			while (k_msgq_get(&hid_report_queue, &current,
+			while (k_msgq_get(&hid_report_queue, &queued,
 					  K_NO_WAIT) == 0) {
+				if (queued.type == LINK_TYPE_KEYBOARD) {
+					memcpy(current_keyboard, queued.data,
+					       sizeof(current_keyboard));
+				}
 			}
-			k_msleep(10);
+			hid_pending_valid = false;
+			k_msleep(1);
 			continue;
 		}
 
-		/* Coalesce states accumulated during USB enumeration. */
-		struct keyboard_report queued;
-
-		while (k_msgq_get(&hid_report_queue, &queued, K_NO_WAIT) == 0) {
-			current = queued;
+		if (!keyboard_data_is_released(current_keyboard) &&
+		    (uint32_t)(now -
+		    (uint32_t)atomic_get(&last_keyboard_packet_ms)) >=
+		    KEYBOARD_LINK_TIMEOUT_MS && !hid_pending_valid) {
+			memset(current_keyboard, 0, sizeof(current_keyboard));
+			atomic_set(&keyboard_watchdog_released, 1);
+			hid_pending.type = LINK_TYPE_KEYBOARD;
+			hid_pending.sequence = 0;
+			memcpy(hid_pending.data, current_keyboard,
+			       sizeof(hid_pending.data));
+			hid_pending_valid = true;
 		}
 
-		(void)send_hid_report(&current);
-
-		/*
-		 * Once configured, preserve every state transition in order.
-		 * A short timeout also lets disconnect/suspend state be observed.
-		 */
-		while (usb_hid_ready()) {
-			if (k_msgq_get(&hid_report_queue, &current,
-				       K_MSEC(20)) == 0) {
-				(void)send_hid_report(&current);
+		if (!hid_pending_valid &&
+		    k_msgq_get(&hid_report_queue, &queued, K_NO_WAIT) == 0) {
+			hid_pending = queued;
+			hid_pending_valid = true;
+			if (queued.type == LINK_TYPE_KEYBOARD) {
+				memcpy(current_keyboard, queued.data,
+				       sizeof(current_keyboard));
 			}
 		}
 
+		if (hid_pending_valid) {
+			int const send_result = hid_pending.type == LINK_TYPE_KEYBOARD ?
+				send_keyboard_report(hid_pending.data) :
+				send_consumer_report(hid_pending.data);
+
+			if (send_result == 0) {
+				hid_pending_valid = false;
+			}
+		}
+
+		/* No blocking HID wait: let the 1 ms USB endpoint callback release the
+		 * idle semaphore while the radio handler remains free to queue input. */
+		k_yield();
 	}
 }
