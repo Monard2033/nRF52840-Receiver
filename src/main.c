@@ -776,16 +776,6 @@ int main(void)
 
 			if (send_result == 0) {
 				hid_pending_valid = false;
-				if (hid_pending.type == LINK_TYPE_KEYBOARD) {
-					next_keyboard_keepalive_ms = now +
-						KEYBOARD_KEEPALIVE_MS;
-				}
-			}
-		} else if (!keyboard_data_is_released(current_keyboard) &&
-			   (int32_t)(now - next_keyboard_keepalive_ms) >= 0) {
-			if (send_keyboard_report(current_keyboard) == 0) {
-				next_keyboard_keepalive_ms = now +
-					KEYBOARD_KEEPALIVE_MS;
 			}
 		}
 
