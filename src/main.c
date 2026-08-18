@@ -130,7 +130,13 @@ static const uint8_t hid_report_descriptor[] = {
 	0x26, 0xFF, 0x00,
 	0x75, 0x08,
 	0x95, HID_FEATURE_PAYLOAD_LEN,
+	0x19, 0x01,       /* Usage Minimum (vendor byte 1) */
+	0x29, HID_FEATURE_PAYLOAD_LEN,
 	0x81, 0x02,
+	/* Local Usage items are cleared after each Main item. Repeat the range
+	 * for the Feature fields so Windows can validate all eight variables. */
+	0x19, 0x01,
+	0x29, HID_FEATURE_PAYLOAD_LEN,
 	0xB1, 0x02,
 	0xC0,
 };
