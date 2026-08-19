@@ -37,10 +37,27 @@ LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 #define HID_REPORT_ID_KEYBOARD 0x01U
 #define HID_REPORT_ID_CONSUMER 0x02U
 #define HID_REPORT_ID_BATTERY  0x03U
-#define KEYBOARD_LINK_TIMEOUT_MS 250U
+#define HID_REPORT_ID_DFU      0x04U
+#define KEYBOARD_LINK_TIMEOUT_MS 2000U
 #define KEYBOARD_KEEPALIVE_MS    8U
 #define HID_FEATURE_PAYLOAD_LEN 8U
 #define HID_FEATURE_REPORT_LEN  (1U + HID_FEATURE_PAYLOAD_LEN)
+#define DFU_FEATURE_PAYLOAD_LEN 8U
+#define DFU_FEATURE_REPORT_LEN  (1U + DFU_FEATURE_PAYLOAD_LEN)
+
+#define LINK_TYPE_DFU_START     0x10U
+#define LINK_TYPE_DFU_DATA      0x11U
+#define LINK_TYPE_DFU_FINISH    0x12U
+#define LINK_TYPE_DFU_STATUS    0x13U
+#define LINK_ACK_TYPE_DFU       0x02U
+
+#define DFU_STATUS_IDLE         0x00U
+#define DFU_STATUS_BUSY         0x01U
+#define DFU_STATUS_OK           0x02U
+#define DFU_STATUS_ERR_SIZE     0x03U
+#define DFU_STATUS_ERR_CRC      0x04U
+#define DFU_STATUS_ERR_FLASH    0x05U
+#define DFU_STATUS_SUCCESS      0x06U
 
 /*
  * This is the on-air packet shared with the transmitter. ESB already adds a
@@ -140,6 +157,20 @@ static const uint8_t hid_report_descriptor[] = {
 	0x29, HID_FEATURE_PAYLOAD_LEN,
 	0xB1, 0x02,
 	0xC0,
+
+	/* Vendor-defined DFU OTA Control/Data Feature report (ID 4). */
+	0x06, 0x01, 0xFF,
+	0x09, 0x01,
+	0xA1, 0x01,
+	0x85, HID_REPORT_ID_DFU,
+	0x15, 0x00,
+	0x26, 0xFF, 0x00,
+	0x75, 0x08,
+	0x95, DFU_FEATURE_PAYLOAD_LEN,
+	0x19, 0x01,
+	0x29, DFU_FEATURE_PAYLOAD_LEN,
+	0xB1, 0x02,
+	0xC0,
 };
 static const struct device *hid_device;
 static atomic_t usb_configured;
@@ -175,6 +206,14 @@ static uint8_t battery_sequence;
 static uint8_t battery_flags;
 static uint32_t battery_last_update_ms;
 static bool battery_cache_valid;
+
+static struct k_spinlock dfu_state_lock;
+static struct link_ack_frame dfu_pending_ack;
+static bool dfu_ack_active;
+static uint8_t dfu_current_status = DFU_STATUS_IDLE;
+static uint8_t dfu_progress_percent = 0;
+static uint16_t dfu_last_offset_div_4 = 0;
+static uint8_t dfu_feature_report[DFU_FEATURE_REPORT_LEN];
 
 /*
  * The ESB event handler runs in interrupt context. It may use a message queue
@@ -257,12 +296,20 @@ static bool receiver_queue_led_ack(void)
 	};
 	struct esb_payload payload = { 0 };
 
-	k_spinlock_key_t key = k_spin_lock(&led_state_lock);
-	ack.sequence = windows_led_sequence;
-	ack.data[0] = windows_led_state;
-	ack.data[1] = windows_led_valid ? 0x01U : 0x00U;
-	ack.data[2] = windows_led_epoch;
-	k_spin_unlock(&led_state_lock, key);
+	k_spinlock_key_t dfu_key = k_spin_lock(&dfu_state_lock);
+	if (dfu_ack_active) {
+		ack = dfu_pending_ack;
+		dfu_ack_active = false;
+		k_spin_unlock(&dfu_state_lock, dfu_key);
+	} else {
+		k_spin_unlock(&dfu_state_lock, dfu_key);
+		k_spinlock_key_t key = k_spin_lock(&led_state_lock);
+		ack.sequence = windows_led_sequence;
+		ack.data[0] = windows_led_state;
+		ack.data[1] = windows_led_valid ? 0x01U : 0x00U;
+		ack.data[2] = windows_led_epoch;
+		k_spin_unlock(&led_state_lock, key);
+	}
 
 	payload.length = sizeof(ack);
 	payload.pipe = 0;
@@ -308,15 +355,23 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 		}
 
 		memcpy(&packet, esb_rx_payload.data, sizeof(packet));
-		if (packet.magic != LINK_MAGIC ||
-		    packet.version != LINK_VERSION ||
-		    (packet.type != LINK_TYPE_KEYBOARD &&
-		     packet.type != LINK_TYPE_CONSUMER &&
-		     packet.type != LINK_TYPE_CONTROL &&
-		     packet.type != LINK_TYPE_BATTERY)) {
+
+		if (packet.magic != LINK_MAGIC || packet.version != LINK_VERSION) {
 			atomic_inc(&radio_bad_packets);
 			continue;
 		}
+
+		if (packet.type == LINK_TYPE_DFU_STATUS) {
+			k_spinlock_key_t key = k_spin_lock(&dfu_state_lock);
+			dfu_current_status = packet.data[0];
+			dfu_progress_percent = packet.data[1];
+			dfu_last_offset_div_4 = (uint16_t)packet.data[2] |
+				((uint16_t)packet.data[3] << 8);
+			k_spin_unlock(&dfu_state_lock, key);
+			ack_needed = true;
+			continue;
+		}
+
 		if (packet.type == LINK_TYPE_BATTERY) {
 			if (!battery_packet_is_valid(&packet)) {
 				atomic_inc(&radio_bad_packets);
@@ -350,32 +405,26 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			previous_keyboard : previous_consumer;
 		uint8_t *previous_sequence = packet.type == LINK_TYPE_KEYBOARD ?
 			&previous_keyboard_sequence : &previous_consumer_sequence;
-		bool const watchdog_needs_state =
-			packet.type == LINK_TYPE_KEYBOARD &&
-			atomic_get(&keyboard_watchdog_released) != 0;
 		bool const sequence_newer = !*previous_valid ||
 			sequence_is_newer(packet.sequence, *previous_sequence);
 		bool const same_sequence_retry = *previous_valid &&
 			packet.sequence == *previous_sequence && *previous_queue_failed;
 
 		/*
-		 * Keyboard packets are absolute states, so an equal state is a
-		 * keepalive even when it has a newer sequence. Consumer packets are
-		 * transitions: a newer sequence must be queued even when its payload
-		 * happens to equal an earlier press or release. Retransmissions reuse
-		 * the same sequence and are discarded only after the first queue put
-		 * succeeded.
+		 * Keyboard packets are absolute states: if the data is identical to
+		 * the current keyboard state, it is a keepalive/duplicate, so drop it
+		 * and do NOT re-queue it to Windows.
 		 */
-		if (*previous_valid && !watchdog_needs_state &&
-		    !sequence_newer && !same_sequence_retry) {
-			atomic_inc(&radio_duplicates);
-			continue;
-		}
-		if (packet.type == LINK_TYPE_KEYBOARD && *previous_valid &&
-		    sequence_newer && !watchdog_needs_state &&
+		if (*previous_valid && !same_sequence_retry &&
+		    packet.type == LINK_TYPE_KEYBOARD &&
 		    memcmp(packet.data, previous_data, INPUT_DATA_SIZE) == 0) {
 			*previous_sequence = packet.sequence;
 			*previous_queue_failed = false;
+			atomic_inc(&radio_duplicates);
+			continue;
+		}
+
+		if (*previous_valid && !sequence_newer && !same_sequence_retry) {
 			atomic_inc(&radio_duplicates);
 			continue;
 		}
@@ -480,15 +529,34 @@ static int hid_get_report(const struct device *dev,
 {
 	ARG_UNUSED(dev);
 
-	if ((setup->wValue >> 8) != 3U ||
-	    (setup->wValue & 0xFFU) != HID_REPORT_ID_BATTERY) {
-		return -ENOTSUP;
+	uint8_t const report_type = setup->wValue >> 8;
+	uint8_t const report_id = setup->wValue & 0xFFU;
+
+	if (report_type == 3U && report_id == HID_REPORT_ID_BATTERY) {
+		battery_feature_build(battery_feature_report);
+		*data = battery_feature_report;
+		*len = sizeof(battery_feature_report);
+		return 0;
 	}
 
-	battery_feature_build(battery_feature_report);
-	*data = battery_feature_report;
-	*len = sizeof(battery_feature_report);
-	return 0;
+	if (report_type == 3U && report_id == HID_REPORT_ID_DFU) {
+		k_spinlock_key_t key = k_spin_lock(&dfu_state_lock);
+		dfu_feature_report[0] = HID_REPORT_ID_DFU;
+		dfu_feature_report[1] = dfu_current_status;
+		dfu_feature_report[2] = dfu_progress_percent;
+		dfu_feature_report[3] = (uint8_t)dfu_last_offset_div_4;
+		dfu_feature_report[4] = (uint8_t)(dfu_last_offset_div_4 >> 8);
+		dfu_feature_report[5] = 0;
+		dfu_feature_report[6] = 0;
+		dfu_feature_report[7] = 0;
+		dfu_feature_report[8] = 0;
+		k_spin_unlock(&dfu_state_lock, key);
+		*data = dfu_feature_report;
+		*len = sizeof(dfu_feature_report);
+		return 0;
+	}
+
+	return -ENOTSUP;
 }
 
 static int hid_set_report(const struct device *dev,
@@ -497,23 +565,41 @@ static int hid_set_report(const struct device *dev,
 {
 	ARG_UNUSED(dev);
 
-	if ((setup->wValue >> 8) != 2U ||
-	    (setup->wValue & 0xFFU) != HID_REPORT_ID_KEYBOARD ||
-	    *len < 1 || *data == NULL) {
-		return -ENOTSUP;
+	uint8_t const report_type = setup->wValue >> 8;
+	uint8_t const report_id = setup->wValue & 0xFFU;
+
+	if (report_type == 2U && report_id == HID_REPORT_ID_KEYBOARD &&
+	    *len >= 1 && *data != NULL) {
+		uint8_t const *const report = *data;
+		if (*len >= 2 && report[0] == HID_REPORT_ID_KEYBOARD) {
+			receiver_set_led_state(report[1]);
+		} else if (*len == 1) {
+			receiver_set_led_state(report[0]);
+		} else {
+			return -EINVAL;
+		}
+		return 0;
 	}
 
-	uint8_t const *const report = *data;
-	if (*len >= 2 && report[0] == HID_REPORT_ID_KEYBOARD) {
-		receiver_set_led_state(report[1]);
-	} else if (*len == 1) {
-		/* Some hosts omit the ID from the data stage because it is already
-		 * present in wValue. Keep that legal control-transfer form working. */
-		receiver_set_led_state(report[0]);
-	} else {
-		return -EINVAL;
+	if (report_type == 3U && report_id == HID_REPORT_ID_DFU &&
+	    *len >= 1 && *data != NULL) {
+		uint8_t const *const report = *data;
+		uint8_t const *const payload = (*len >= DFU_FEATURE_REPORT_LEN && report[0] == HID_REPORT_ID_DFU) ?
+			&report[1] : report;
+		k_spinlock_key_t key = k_spin_lock(&dfu_state_lock);
+		dfu_pending_ack.magic = LINK_ACK_MAGIC;
+		dfu_pending_ack.version = LINK_VERSION;
+		dfu_pending_ack.type = LINK_ACK_TYPE_DFU;
+		dfu_pending_ack.sequence++;
+		memcpy(dfu_pending_ack.data, payload, INPUT_DATA_SIZE);
+		dfu_ack_active = true;
+		dfu_current_status = DFU_STATUS_BUSY;
+		k_spin_unlock(&dfu_state_lock, key);
+		atomic_set(&led_ack_pending, 1);
+		return 0;
 	}
-	return 0;
+
+	return -ENOTSUP;
 }
 
 static void hid_int_in_ready(const struct device *dev)
