@@ -38,8 +38,6 @@ LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 #define HID_REPORT_ID_CONSUMER 0x02U
 #define HID_REPORT_ID_BATTERY  0x03U
 #define HID_REPORT_ID_DFU      0x04U
-#define KEYBOARD_LINK_TIMEOUT_MS 2000U
-#define KEYBOARD_KEEPALIVE_MS    8U
 #define HID_FEATURE_PAYLOAD_LEN 8U
 #define HID_FEATURE_REPORT_LEN  (1U + HID_FEATURE_PAYLOAD_LEN)
 #define DFU_FEATURE_PAYLOAD_LEN 8U
@@ -188,17 +186,14 @@ static atomic_t radio_init_error;
 static atomic_t hid_queue_overruns;
 static atomic_t hid_reports_sent;
 static atomic_t hid_write_errors;
-static atomic_t last_keyboard_packet_ms;
-static atomic_t last_consumer_packet_ms;
-static atomic_t keyboard_watchdog_released;
-
-static bool previous_radio_valid;
-static uint8_t previous_radio_sequence;
-static bool previous_radio_queue_failed;
 static bool previous_keyboard_valid;
 static bool previous_consumer_valid;
+static bool previous_keyboard_queue_failed;
+static bool previous_consumer_queue_failed;
 static uint8_t previous_keyboard[INPUT_DATA_SIZE];
 static uint8_t previous_consumer[INPUT_DATA_SIZE];
+static uint8_t previous_keyboard_sequence;
+static uint8_t previous_consumer_sequence;
 
 static struct k_spinlock led_state_lock;
 static uint8_t windows_led_state;
@@ -206,7 +201,7 @@ static uint8_t windows_led_sequence;
 static uint8_t windows_led_epoch;
 static bool windows_led_valid;
 static atomic_t led_ack_pending;
-static atomic_t battery_poll_requested;
+static atomic_t led_ack_dirty;
 
 static struct k_spinlock battery_cache_lock;
 static uint8_t battery_percentage;
@@ -284,17 +279,20 @@ static void receiver_set_led_state(uint8_t led_state)
 {
 	led_state &= 0x07U;
 	k_spinlock_key_t key = k_spin_lock(&led_state_lock);
+	bool const changed = !windows_led_valid ||
+		windows_led_state != led_state;
 
-	if (!windows_led_valid || windows_led_state != led_state) {
+	if (changed) {
 		windows_led_state = led_state;
 		windows_led_sequence++;
 	}
 	windows_led_valid = true;
 	k_spin_unlock(&led_state_lock, key);
 
-	/* Queue the new Windows state immediately. It will be attached to the
-	 * next eligible ESB ACK without waiting for another RX handler cycle. */
-	atomic_set(&led_ack_pending, 1);
+	if (changed) {
+		atomic_set(&led_ack_dirty, 1);
+		atomic_set(&led_ack_pending, 1);
+	}
 }
 
 static bool receiver_queue_led_ack(void)
@@ -313,11 +311,11 @@ static bool receiver_queue_led_ack(void)
 		k_spin_unlock(&dfu_state_lock, dfu_key);
 	} else {
 		k_spin_unlock(&dfu_state_lock, dfu_key);
+		atomic_set(&led_ack_dirty, 0);
 		k_spinlock_key_t key = k_spin_lock(&led_state_lock);
 		ack.sequence = windows_led_sequence;
 		ack.data[0] = windows_led_state;
-		ack.data[1] = (windows_led_valid ? 0x01U : 0x00U) |
-			(atomic_cas(&battery_poll_requested, 1, 0) ? 0x02U : 0x00U);
+		ack.data[1] = windows_led_valid ? 0x01U : 0x00U;
 		ack.data[2] = windows_led_epoch;
 		k_spin_unlock(&led_state_lock, key);
 	}
@@ -326,7 +324,13 @@ static bool receiver_queue_led_ack(void)
 	payload.pipe = 0;
 	payload.noack = false;
 	memcpy(payload.data, &ack, sizeof(ack));
-	return esb_write_payload(&payload) == 0;
+	bool const queued = esb_write_payload(&payload) == 0;
+	if (!queued) {
+		/* No immediate retry: retain dirty state and wait for the next RX
+		 * event, avoiding a tight loop on the three-entry ACK FIFO. */
+		atomic_set(&led_ack_dirty, 1);
+	}
+	return queued;
 }
 
 static void receiver_ack_task(void)
@@ -359,6 +363,10 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			continue;
 		}
 
+		if (atomic_get(&led_ack_dirty) != 0) {
+			atomic_set(&led_ack_pending, 1);
+		}
+
 		if (packet.type == LINK_TYPE_DFU_STATUS) {
 			k_spinlock_key_t key = k_spin_lock(&dfu_state_lock);
 			dfu_current_status = packet.data[0];
@@ -387,53 +395,47 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			continue;
 		}
 
-		if (packet.type == LINK_TYPE_KEYBOARD) {
-			atomic_set(&last_keyboard_packet_ms, k_uptime_get_32());
-		} else if (packet.type == LINK_TYPE_CONSUMER) {
-			atomic_set(&last_consumer_packet_ms, k_uptime_get_32());
-		}
-
-		bool const sequence_newer = !previous_radio_valid ||
-			sequence_is_newer(packet.sequence, previous_radio_sequence);
-		bool const same_sequence_retry = previous_radio_valid &&
-			packet.sequence == previous_radio_sequence && previous_radio_queue_failed;
+		bool *previous_valid = packet.type == LINK_TYPE_KEYBOARD ?
+			&previous_keyboard_valid : &previous_consumer_valid;
+		bool *previous_queue_failed = packet.type == LINK_TYPE_KEYBOARD ?
+			&previous_keyboard_queue_failed : &previous_consumer_queue_failed;
+		uint8_t *previous_data = packet.type == LINK_TYPE_KEYBOARD ?
+			previous_keyboard : previous_consumer;
+		uint8_t *previous_sequence = packet.type == LINK_TYPE_KEYBOARD ?
+			&previous_keyboard_sequence : &previous_consumer_sequence;
+		bool const sequence_newer = !*previous_valid ||
+			sequence_is_newer(packet.sequence, *previous_sequence);
+		bool const same_sequence_retry = *previous_valid &&
+			packet.sequence == *previous_sequence && *previous_queue_failed;
 
 		/*
 		 * Keyboard packets are absolute states: if the data is identical to
 		 * the current keyboard state, it is a keepalive/duplicate, so drop it
 		 * and do NOT re-queue it to Windows.
 		 */
-		if (previous_keyboard_valid && !same_sequence_retry &&
+		if (*previous_valid && !same_sequence_retry &&
 		    packet.type == LINK_TYPE_KEYBOARD &&
-		    memcmp(packet.data, previous_keyboard, INPUT_DATA_SIZE) == 0) {
-			previous_radio_sequence = packet.sequence;
-			previous_radio_valid = true;
-			previous_radio_queue_failed = false;
+		    memcmp(packet.data, previous_data, INPUT_DATA_SIZE) == 0) {
+			*previous_sequence = packet.sequence;
+			*previous_queue_failed = false;
 			atomic_inc(&radio_duplicates);
 			continue;
 		}
 
-		if (previous_radio_valid && !sequence_newer && !same_sequence_retry) {
+		if (*previous_valid && !sequence_newer && !same_sequence_retry) {
 			atomic_inc(&radio_duplicates);
 			continue;
 		}
 
 		if (queue_hid_report(&packet)) {
-			previous_radio_valid = true;
-			previous_radio_sequence = packet.sequence;
-			previous_radio_queue_failed = false;
-			if (packet.type == LINK_TYPE_KEYBOARD) {
-				previous_keyboard_valid = true;
-				memcpy(previous_keyboard, packet.data, INPUT_DATA_SIZE);
-				atomic_set(&keyboard_watchdog_released, 0);
-			} else if (packet.type == LINK_TYPE_CONSUMER) {
-				previous_consumer_valid = true;
-				memcpy(previous_consumer, packet.data, INPUT_DATA_SIZE);
-			}
+			*previous_valid = true;
+			*previous_sequence = packet.sequence;
+			*previous_queue_failed = false;
+			memcpy(previous_data, packet.data, INPUT_DATA_SIZE);
 		} else {
-			previous_radio_valid = true;
-			previous_radio_sequence = packet.sequence;
-			previous_radio_queue_failed = true;
+			*previous_valid = true;
+			*previous_sequence = packet.sequence;
+			*previous_queue_failed = true;
 		}
 	}
 }
@@ -589,8 +591,8 @@ static int hid_set_report(const struct device *dev,
 	}
 
 	if (report_type == 3U && report_id == HID_REPORT_ID_BATTERY) {
-		atomic_set(&battery_poll_requested, 1);
-		atomic_set(&led_ack_pending, 1);
+		/* Cached telemetry only. Battery polling must not create reverse ACK
+		 * traffic on the keyboard hot path. */
 		return 0;
 	}
 
@@ -765,19 +767,10 @@ K_THREAD_DEFINE(status_thread_id, 1024, status_thread,
 		NULL, NULL, NULL, 7, 0, 0);
 #endif
 
-static bool keyboard_data_is_released(const uint8_t data[INPUT_DATA_SIZE])
-{
-	static const uint8_t released[INPUT_DATA_SIZE] = { 0 };
-
-	return memcmp(data, released, sizeof(released)) == 0;
-}
-
 int main(void)
 {
-	uint8_t current_keyboard[INPUT_DATA_SIZE] = { 0 };
 	struct link_input_packet hid_pending = { 0 };
 	bool hid_pending_valid = false;
-	uint32_t next_keyboard_keepalive_ms = 0;
 	int err;
 
 	LOG_INF("Starting ESB-to-USB keyboard and consumer-control receiver");
@@ -806,8 +799,6 @@ int main(void)
 
 	for (;;) {
 		struct link_input_packet queued;
-		uint32_t const now = k_uptime_get_32();
-
 		receiver_ack_task();
 
 		if (!usb_hid_ready()) {
@@ -817,46 +808,17 @@ int main(void)
 			 */
 			while (k_msgq_get(&hid_report_queue, &queued,
 					  K_NO_WAIT) == 0) {
-				if (queued.type == LINK_TYPE_KEYBOARD) {
-					memcpy(current_keyboard, queued.data,
-					       sizeof(current_keyboard));
-				}
+				/* Input transitions are not replayed after USB reconnect. */
 			}
 			hid_pending_valid = false;
 			k_msleep(1);
 			continue;
 		}
 
-		if (!keyboard_data_is_released(current_keyboard) &&
-		    (uint32_t)(now -
-		    (uint32_t)atomic_get(&last_keyboard_packet_ms)) >=
-		    KEYBOARD_LINK_TIMEOUT_MS && !hid_pending_valid) {
-			memset(current_keyboard, 0, sizeof(current_keyboard));
-			atomic_set(&keyboard_watchdog_released, 1);
-			hid_pending.type = LINK_TYPE_KEYBOARD;
-			hid_pending.sequence = 0;
-			memcpy(hid_pending.data, current_keyboard,
-			       sizeof(hid_pending.data));
-			hid_pending_valid = true;
-		}
-
-		if (previous_consumer_valid && (previous_consumer[0] != 0 || previous_consumer[1] != 0) &&
-		    (uint32_t)(now - (uint32_t)atomic_get(&last_consumer_packet_ms)) >= 1000U && !hid_pending_valid) {
-			memset(previous_consumer, 0, sizeof(previous_consumer));
-			hid_pending.type = LINK_TYPE_CONSUMER;
-			hid_pending.sequence = 0;
-			memset(hid_pending.data, 0, sizeof(hid_pending.data));
-			hid_pending_valid = true;
-		}
-
 		if (!hid_pending_valid &&
 		    k_msgq_get(&hid_report_queue, &queued, K_NO_WAIT) == 0) {
 			hid_pending = queued;
 			hid_pending_valid = true;
-			if (queued.type == LINK_TYPE_KEYBOARD) {
-				memcpy(current_keyboard, queued.data,
-				       sizeof(current_keyboard));
-			}
 		}
 
 		if (hid_pending_valid) {
