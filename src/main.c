@@ -276,8 +276,11 @@ static struct k_spinlock dfu_state_lock;
 static struct link_ack_frame dfu_pending_ack;
 static bool dfu_ack_active;
 static uint8_t dfu_current_status = DFU_STATUS_IDLE;
-static uint8_t dfu_progress_percent = 0;
-static uint16_t dfu_last_offset_div_4 = 0;
+static uint8_t dfu_status_session;
+static uint8_t dfu_status_token;
+static uint8_t dfu_status_detail;
+static uint32_t dfu_status_value;
+static uint8_t dfu_command_sequence;
 static uint8_t dfu_feature_report[DFU_FEATURE_REPORT_LEN];
 
 static void trace_record(uint8_t stage,
@@ -434,7 +437,6 @@ static bool receiver_queue_led_ack(void)
 	k_spinlock_key_t dfu_key = k_spin_lock(&dfu_state_lock);
 	if (dfu_ack_active) {
 		ack = dfu_pending_ack;
-		dfu_ack_active = false;
 		k_spin_unlock(&dfu_state_lock, dfu_key);
 	} else {
 		k_spin_unlock(&dfu_state_lock, dfu_key);
@@ -453,9 +455,8 @@ static bool receiver_queue_led_ack(void)
 	memcpy(payload.data, &ack, sizeof(ack));
 	bool const queued = esb_write_payload(&payload) == 0;
 	if (!queued) {
-		/* No immediate retry: retain dirty state and wait for the next RX
-		 * event, avoiding a tight loop on the three-entry ACK FIFO. */
-		atomic_set(&led_ack_dirty, 1);
+		/* Preserve both the pending DFU command and the retry request. */
+		atomic_set(&led_ack_pending, 1);
 	}
 	return queued;
 }
@@ -535,16 +536,31 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			continue;
 		}
 
-		if (atomic_get(&led_ack_dirty) != 0) {
+		/* An ACK payload queued now is attached to the next PTX probe. Keep
+		 * scheduling the same command until the RP2040 status proves that it
+		 * was consumed end-to-end. */
+		k_spinlock_key_t pending_key = k_spin_lock(&dfu_state_lock);
+		bool const command_pending = dfu_ack_active;
+		k_spin_unlock(&dfu_state_lock, pending_key);
+		if (atomic_get(&led_ack_dirty) != 0 || command_pending) {
 			atomic_set(&led_ack_pending, 1);
 		}
 
 		if (packet.type == LINK_TYPE_DFU_STATUS) {
 			k_spinlock_key_t key = k_spin_lock(&dfu_state_lock);
 			dfu_current_status = packet.data[0];
-			dfu_progress_percent = packet.data[1];
-			dfu_last_offset_div_4 = (uint16_t)packet.data[2] |
-				((uint16_t)packet.data[3] << 8);
+			dfu_status_session = packet.data[1];
+			dfu_status_token = packet.data[2];
+			dfu_status_detail = packet.data[3];
+			dfu_status_value = (uint32_t)packet.data[4] |
+				((uint32_t)packet.data[5] << 8) |
+				((uint32_t)packet.data[6] << 16) |
+				((uint32_t)packet.data[7] << 24);
+			if (dfu_ack_active &&
+			    packet.data[1] == dfu_pending_ack.data[1] &&
+			    packet.data[2] == dfu_pending_ack.sequence) {
+				dfu_ack_active = false;
+			}
 			k_spin_unlock(&dfu_state_lock, key);
 			atomic_set(&led_ack_pending, 1);
 			continue;
@@ -746,13 +762,13 @@ static int hid_get_report(const struct device *dev,
 		k_spinlock_key_t key = k_spin_lock(&dfu_state_lock);
 		dfu_feature_report[0] = HID_REPORT_ID_DFU;
 		dfu_feature_report[1] = dfu_current_status;
-		dfu_feature_report[2] = dfu_progress_percent;
-		dfu_feature_report[3] = (uint8_t)dfu_last_offset_div_4;
-		dfu_feature_report[4] = (uint8_t)(dfu_last_offset_div_4 >> 8);
-		dfu_feature_report[5] = 0;
-		dfu_feature_report[6] = 0;
-		dfu_feature_report[7] = 0;
-		dfu_feature_report[8] = 0;
+		dfu_feature_report[2] = dfu_status_session;
+		dfu_feature_report[3] = dfu_status_token;
+		dfu_feature_report[4] = dfu_status_detail;
+		dfu_feature_report[5] = (uint8_t)dfu_status_value;
+		dfu_feature_report[6] = (uint8_t)(dfu_status_value >> 8);
+		dfu_feature_report[7] = (uint8_t)(dfu_status_value >> 16);
+		dfu_feature_report[8] = (uint8_t)(dfu_status_value >> 24);
 		k_spin_unlock(&dfu_state_lock, key);
 		*data = dfu_feature_report;
 		*len = sizeof(dfu_feature_report);
@@ -794,16 +810,38 @@ static int hid_set_report(const struct device *dev,
 	if (report_type == 3U && report_id == HID_REPORT_ID_DFU &&
 	    *len >= 1 && *data != NULL) {
 		uint8_t const *const report = *data;
-		uint8_t const *const payload = (*len >= DFU_FEATURE_REPORT_LEN && report[0] == HID_REPORT_ID_DFU) ?
-			&report[1] : report;
+		uint8_t const *payload;
+		if (*len >= DFU_FEATURE_REPORT_LEN &&
+		    report[0] == HID_REPORT_ID_DFU) {
+			payload = &report[1];
+		} else if (*len >= DFU_FEATURE_PAYLOAD_LEN) {
+			payload = report;
+		} else {
+			return -EINVAL;
+		}
 		k_spinlock_key_t key = k_spin_lock(&dfu_state_lock);
+		if (dfu_ack_active) {
+			bool const duplicate =
+				memcmp(dfu_pending_ack.data, payload,
+				       INPUT_DATA_SIZE) == 0;
+			k_spin_unlock(&dfu_state_lock, key);
+			if (duplicate) {
+				atomic_set(&led_ack_pending, 1);
+				return 0;
+			}
+			return -EBUSY;
+		}
 		dfu_pending_ack.magic = LINK_ACK_MAGIC;
 		dfu_pending_ack.version = LINK_VERSION;
 		dfu_pending_ack.type = LINK_ACK_TYPE_DFU;
-		dfu_pending_ack.sequence++;
+		dfu_pending_ack.sequence = ++dfu_command_sequence;
 		memcpy(dfu_pending_ack.data, payload, INPUT_DATA_SIZE);
 		dfu_ack_active = true;
 		dfu_current_status = DFU_STATUS_BUSY;
+		dfu_status_session = payload[1];
+		dfu_status_token = dfu_pending_ack.sequence;
+		dfu_status_detail = 0;
+		dfu_status_value = 0;
 		k_spin_unlock(&dfu_state_lock, key);
 		atomic_set(&led_ack_pending, 1);
 		return 0;
