@@ -42,7 +42,6 @@ LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 #define HID_FEATURE_REPORT_LEN  (1U + HID_FEATURE_PAYLOAD_LEN)
 #define DFU_FEATURE_PAYLOAD_LEN 8U
 #define DFU_FEATURE_REPORT_LEN  (1U + DFU_FEATURE_PAYLOAD_LEN)
-#define KEYBOARD_LINK_TIMEOUT_MS 2000U
 #define RELEASE_REPEAT_DELAY_MS  1U
 
 #define LINK_TYPE_DFU_START     0x10U
@@ -188,7 +187,7 @@ static atomic_t radio_init_error;
 static atomic_t hid_queue_overruns;
 static atomic_t hid_reports_sent;
 static atomic_t hid_write_errors;
-static atomic_t last_keyboard_packet_ms;
+static atomic_t keyboard_rx_generation;
 static bool previous_keyboard_valid;
 static bool previous_consumer_valid;
 static bool previous_keyboard_queue_failed;
@@ -434,7 +433,7 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 		}
 
 		if (packet.type == LINK_TYPE_KEYBOARD) {
-			atomic_set(&last_keyboard_packet_ms, k_uptime_get_32());
+			atomic_inc(&keyboard_rx_generation);
 		}
 
 		if (*previous_valid && !sequence_newer && !same_sequence_retry) {
@@ -792,7 +791,7 @@ int main(void)
 	bool hid_pending_is_release_repeat = false;
 	bool release_repeat_pending = false;
 	uint32_t release_repeat_after_ms = 0;
-	uint8_t current_keyboard[INPUT_DATA_SIZE] = { 0 };
+	uint32_t release_repeat_generation = 0;
 	int err;
 
 	LOG_INF("Starting ESB-to-USB keyboard and consumer-control receiver");
@@ -853,23 +852,14 @@ int main(void)
 
 		if (!hid_pending_valid && release_repeat_pending &&
 		    (int32_t)(now - release_repeat_after_ms) >= 0) {
-			hid_pending.type = LINK_TYPE_KEYBOARD;
-			memset(hid_pending.data, 0, sizeof(hid_pending.data));
-			hid_pending_valid = true;
-			hid_pending_is_release_repeat = true;
+			if ((uint32_t)atomic_get(&keyboard_rx_generation) ==
+			    release_repeat_generation) {
+				hid_pending.type = LINK_TYPE_KEYBOARD;
+				memset(hid_pending.data, 0, sizeof(hid_pending.data));
+				hid_pending_valid = true;
+				hid_pending_is_release_repeat = true;
+			}
 			release_repeat_pending = false;
-		}
-
-		if (!hid_pending_valid &&
-		    memcmp(current_keyboard,
-			   (uint8_t[INPUT_DATA_SIZE]){ 0 },
-			   INPUT_DATA_SIZE) != 0 &&
-		    (uint32_t)(now - (uint32_t)atomic_get(
-			    &last_keyboard_packet_ms)) >= KEYBOARD_LINK_TIMEOUT_MS) {
-			hid_pending.type = LINK_TYPE_KEYBOARD;
-			memset(hid_pending.data, 0, sizeof(hid_pending.data));
-			hid_pending_valid = true;
-			hid_pending_is_release_repeat = false;
 		}
 
 		if (hid_pending_valid) {
@@ -879,8 +869,6 @@ int main(void)
 
 			if (send_result == 0) {
 				if (hid_pending.type == LINK_TYPE_KEYBOARD) {
-					memcpy(current_keyboard, hid_pending.data,
-					       sizeof(current_keyboard));
 					if (memcmp(hid_pending.data,
 						   (uint8_t[INPUT_DATA_SIZE]){ 0 },
 						   INPUT_DATA_SIZE) == 0 &&
@@ -888,6 +876,9 @@ int main(void)
 						release_repeat_pending = true;
 						release_repeat_after_ms = now +
 							RELEASE_REPEAT_DELAY_MS;
+						release_repeat_generation =
+							(uint32_t)atomic_get(
+								&keyboard_rx_generation);
 					}
 				}
 				hid_pending_valid = false;
