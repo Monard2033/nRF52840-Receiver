@@ -49,6 +49,8 @@ LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 #define TRACE_CMD_CLEAR         0x01U
 #define TRACE_CMD_FREEZE        0x02U
 #define TRACE_CMD_RESUME        0x03U
+#define BATTERY_VALID_MIN_MV    2800U
+#define BATTERY_VALID_MAX_MV    4300U
 
 #define LINK_TYPE_DFU_START     0x10U
 #define LINK_TYPE_DFU_DATA      0x11U
@@ -369,7 +371,12 @@ static bool sequence_is_newer(uint8_t sequence, uint8_t previous)
 
 static bool battery_packet_is_valid(const struct link_input_packet *packet)
 {
+	uint16_t const millivolts = (uint16_t)packet->data[2] |
+		((uint16_t)packet->data[3] << 8);
+
 	return packet->data[0] <= 100U && packet->data[1] <= 4U &&
+	       millivolts >= BATTERY_VALID_MIN_MV &&
+	       millivolts <= BATTERY_VALID_MAX_MV &&
 	       (packet->data[5] & 0x01U) != 0U &&
 	       (packet->data[5] & 0xF0U) == 0U &&
 	       packet->data[6] == 0U && packet->data[7] == 0U;
