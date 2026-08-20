@@ -30,6 +30,7 @@ LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 #define LINK_TYPE_CONTROL      0x03U
 #define LINK_TYPE_BATTERY      0x04U
 #define LINK_CONTROL_POLL_ACK  0x02U
+#define LINK_CONTROL_SESSION_RESET 0x03U
 #define LINK_ACK_MAGIC         0x5AU
 #define LINK_ACK_TYPE_LOCK_STATE 0x01U
 #define LINK_RF_CHANNEL        80U
@@ -466,6 +467,51 @@ static void receiver_ack_task(void)
 	}
 }
 
+static void receiver_reset_input_session(void)
+{
+	bool const keyboard_was_pressed = previous_keyboard_valid &&
+		memcmp(previous_keyboard, (uint8_t[INPUT_DATA_SIZE]){ 0 },
+		       INPUT_DATA_SIZE) != 0;
+	bool const consumer_was_pressed = previous_consumer_valid &&
+		memcmp(previous_consumer, (uint8_t[INPUT_DATA_SIZE]){ 0 },
+		       INPUT_DATA_SIZE) != 0;
+
+	previous_keyboard_valid = false;
+	previous_consumer_valid = false;
+	previous_keyboard_queue_failed = false;
+	previous_consumer_queue_failed = false;
+	previous_keyboard_sequence = 0U;
+	previous_consumer_sequence = 0U;
+	memset(previous_keyboard, 0, sizeof(previous_keyboard));
+	memset(previous_consumer, 0, sizeof(previous_consumer));
+
+	k_spinlock_key_t key = k_spin_lock(&battery_cache_lock);
+	battery_cache_valid = false;
+	battery_flags = 0U;
+	battery_sequence = 0U;
+	battery_last_update_ms = 0U;
+	k_spin_unlock(&battery_cache_lock, key);
+
+	/* Release only a state that was actually held in the previous RP2040
+	 * session. The first new real frame is then accepted regardless of seq. */
+	if (keyboard_was_pressed) {
+		struct link_input_packet const release = {
+			.magic = LINK_MAGIC,
+			.version = LINK_VERSION,
+			.type = LINK_TYPE_KEYBOARD,
+		};
+		(void)queue_hid_report(&release);
+	}
+	if (consumer_was_pressed) {
+		struct link_input_packet const release = {
+			.magic = LINK_MAGIC,
+			.version = LINK_VERSION,
+			.type = LINK_TYPE_CONSUMER,
+		};
+		(void)queue_hid_report(&release);
+	}
+}
+
 static void receiver_esb_event_handler(const struct esb_evt *event)
 {
 	if (event->evt_id != ESB_EVENT_RX_RECEIVED) {
@@ -514,6 +560,10 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 		}
 
 		if (packet.type == LINK_TYPE_CONTROL) {
+			if (packet.data[0] == LINK_CONTROL_SESSION_RESET) {
+				receiver_reset_input_session();
+				continue;
+			}
 			if (packet.data[0] != LINK_CONTROL_POLL_ACK) {
 				atomic_inc(&radio_bad_packets);
 				continue;
