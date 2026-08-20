@@ -42,7 +42,6 @@ LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 #define HID_FEATURE_REPORT_LEN  (1U + HID_FEATURE_PAYLOAD_LEN)
 #define DFU_FEATURE_PAYLOAD_LEN 8U
 #define DFU_FEATURE_REPORT_LEN  (1U + DFU_FEATURE_PAYLOAD_LEN)
-#define RELEASE_REPEAT_DELAY_MS  1U
 
 #define LINK_TYPE_DFU_START     0x10U
 #define LINK_TYPE_DFU_DATA      0x11U
@@ -187,7 +186,6 @@ static atomic_t radio_init_error;
 static atomic_t hid_queue_overruns;
 static atomic_t hid_reports_sent;
 static atomic_t hid_write_errors;
-static atomic_t keyboard_rx_generation;
 static bool previous_keyboard_valid;
 static bool previous_consumer_valid;
 static bool previous_keyboard_queue_failed;
@@ -204,7 +202,6 @@ static uint8_t windows_led_epoch;
 static bool windows_led_valid;
 static atomic_t led_ack_pending;
 static atomic_t led_ack_dirty;
-static atomic_t battery_poll_requested;
 
 static struct k_spinlock battery_cache_lock;
 static uint8_t battery_percentage;
@@ -306,7 +303,6 @@ static bool receiver_queue_led_ack(void)
 		.type = LINK_ACK_TYPE_LOCK_STATE,
 	};
 	struct esb_payload payload = { 0 };
-	bool battery_request_in_ack = false;
 
 	k_spinlock_key_t dfu_key = k_spin_lock(&dfu_state_lock);
 	if (dfu_ack_active) {
@@ -316,13 +312,10 @@ static bool receiver_queue_led_ack(void)
 	} else {
 		k_spin_unlock(&dfu_state_lock, dfu_key);
 		atomic_set(&led_ack_dirty, 0);
-		battery_request_in_ack =
-			atomic_cas(&battery_poll_requested, 1, 0);
 		k_spinlock_key_t key = k_spin_lock(&led_state_lock);
 		ack.sequence = windows_led_sequence;
 		ack.data[0] = windows_led_state;
-		ack.data[1] = (windows_led_valid ? 0x01U : 0x00U) |
-			(battery_request_in_ack ? 0x02U : 0x00U);
+		ack.data[1] = windows_led_valid ? 0x01U : 0x00U;
 		ack.data[2] = windows_led_epoch;
 		k_spin_unlock(&led_state_lock, key);
 	}
@@ -336,9 +329,6 @@ static bool receiver_queue_led_ack(void)
 		/* No immediate retry: retain dirty state and wait for the next RX
 		 * event, avoiding a tight loop on the three-entry ACK FIFO. */
 		atomic_set(&led_ack_dirty, 1);
-		if (battery_request_in_ack) {
-			atomic_set(&battery_poll_requested, 1);
-		}
 	}
 	return queued;
 }
@@ -430,10 +420,6 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			*previous_queue_failed = false;
 			atomic_inc(&radio_duplicates);
 			continue;
-		}
-
-		if (packet.type == LINK_TYPE_KEYBOARD) {
-			atomic_inc(&keyboard_rx_generation);
 		}
 
 		if (*previous_valid && !sequence_newer && !same_sequence_retry) {
@@ -605,11 +591,8 @@ static int hid_set_report(const struct device *dev,
 	}
 
 	if (report_type == 3U && report_id == HID_REPORT_ID_BATTERY) {
-		/* Refresh now: attach one request bit to the next bounded ACK payload.
-		 * There is no retry loop; FIFO-full waits for the next ESB RX event. */
-		atomic_set(&battery_poll_requested, 1);
-		atomic_set(&led_ack_dirty, 1);
-		atomic_set(&led_ack_pending, 1);
+		/* Cached telemetry only. Battery polling must not create reverse ACK
+		 * traffic on the keyboard hot path. */
 		return 0;
 	}
 
@@ -788,10 +771,6 @@ int main(void)
 {
 	struct link_input_packet hid_pending = { 0 };
 	bool hid_pending_valid = false;
-	bool hid_pending_is_release_repeat = false;
-	bool release_repeat_pending = false;
-	uint32_t release_repeat_after_ms = 0;
-	uint32_t release_repeat_generation = 0;
 	int err;
 
 	LOG_INF("Starting ESB-to-USB keyboard and consumer-control receiver");
@@ -820,7 +799,6 @@ int main(void)
 
 	for (;;) {
 		struct link_input_packet queued;
-		uint32_t const now = k_uptime_get_32();
 		receiver_ack_task();
 
 		if (!usb_hid_ready()) {
@@ -833,7 +811,6 @@ int main(void)
 				/* Input transitions are not replayed after USB reconnect. */
 			}
 			hid_pending_valid = false;
-			release_repeat_pending = false;
 			k_msleep(1);
 			continue;
 		}
@@ -842,24 +819,6 @@ int main(void)
 		    k_msgq_get(&hid_report_queue, &queued, K_NO_WAIT) == 0) {
 			hid_pending = queued;
 			hid_pending_valid = true;
-			hid_pending_is_release_repeat = false;
-			if (queued.type == LINK_TYPE_KEYBOARD &&
-			    memcmp(queued.data, (uint8_t[INPUT_DATA_SIZE]){ 0 },
-				   INPUT_DATA_SIZE) != 0) {
-				release_repeat_pending = false;
-			}
-		}
-
-		if (!hid_pending_valid && release_repeat_pending &&
-		    (int32_t)(now - release_repeat_after_ms) >= 0) {
-			if ((uint32_t)atomic_get(&keyboard_rx_generation) ==
-			    release_repeat_generation) {
-				hid_pending.type = LINK_TYPE_KEYBOARD;
-				memset(hid_pending.data, 0, sizeof(hid_pending.data));
-				hid_pending_valid = true;
-				hid_pending_is_release_repeat = true;
-			}
-			release_repeat_pending = false;
 		}
 
 		if (hid_pending_valid) {
@@ -868,19 +827,6 @@ int main(void)
 				send_consumer_report(hid_pending.data);
 
 			if (send_result == 0) {
-				if (hid_pending.type == LINK_TYPE_KEYBOARD) {
-					if (memcmp(hid_pending.data,
-						   (uint8_t[INPUT_DATA_SIZE]){ 0 },
-						   INPUT_DATA_SIZE) == 0 &&
-					    !hid_pending_is_release_repeat) {
-						release_repeat_pending = true;
-						release_repeat_after_ms = now +
-							RELEASE_REPEAT_DELAY_MS;
-						release_repeat_generation =
-							(uint32_t)atomic_get(
-								&keyboard_rx_generation);
-					}
-				}
 				hid_pending_valid = false;
 			}
 		}
