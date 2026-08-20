@@ -192,14 +192,13 @@ static atomic_t last_keyboard_packet_ms;
 static atomic_t last_consumer_packet_ms;
 static atomic_t keyboard_watchdog_released;
 
+static bool previous_radio_valid;
+static uint8_t previous_radio_sequence;
+static bool previous_radio_queue_failed;
 static bool previous_keyboard_valid;
 static bool previous_consumer_valid;
-static bool previous_keyboard_queue_failed;
-static bool previous_consumer_queue_failed;
 static uint8_t previous_keyboard[INPUT_DATA_SIZE];
 static uint8_t previous_consumer[INPUT_DATA_SIZE];
-static uint8_t previous_keyboard_sequence;
-static uint8_t previous_consumer_sequence;
 
 static struct k_spinlock led_state_lock;
 static uint8_t windows_led_state;
@@ -394,50 +393,47 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			atomic_set(&last_consumer_packet_ms, k_uptime_get_32());
 		}
 
-		bool *previous_valid = packet.type == LINK_TYPE_KEYBOARD ?
-			&previous_keyboard_valid : &previous_consumer_valid;
-		bool *previous_queue_failed = packet.type == LINK_TYPE_KEYBOARD ?
-			&previous_keyboard_queue_failed : &previous_consumer_queue_failed;
-		uint8_t *previous_data = packet.type == LINK_TYPE_KEYBOARD ?
-			previous_keyboard : previous_consumer;
-		uint8_t *previous_sequence = packet.type == LINK_TYPE_KEYBOARD ?
-			&previous_keyboard_sequence : &previous_consumer_sequence;
-		bool const sequence_newer = !*previous_valid ||
-			sequence_is_newer(packet.sequence, *previous_sequence);
-		bool const same_sequence_retry = *previous_valid &&
-			packet.sequence == *previous_sequence && *previous_queue_failed;
+		bool const sequence_newer = !previous_radio_valid ||
+			sequence_is_newer(packet.sequence, previous_radio_sequence);
+		bool const same_sequence_retry = previous_radio_valid &&
+			packet.sequence == previous_radio_sequence && previous_radio_queue_failed;
 
 		/*
 		 * Keyboard packets are absolute states: if the data is identical to
 		 * the current keyboard state, it is a keepalive/duplicate, so drop it
 		 * and do NOT re-queue it to Windows.
 		 */
-		if (*previous_valid && !same_sequence_retry &&
+		if (previous_keyboard_valid && !same_sequence_retry &&
 		    packet.type == LINK_TYPE_KEYBOARD &&
-		    memcmp(packet.data, previous_data, INPUT_DATA_SIZE) == 0) {
-			*previous_sequence = packet.sequence;
-			*previous_queue_failed = false;
+		    memcmp(packet.data, previous_keyboard, INPUT_DATA_SIZE) == 0) {
+			previous_radio_sequence = packet.sequence;
+			previous_radio_valid = true;
+			previous_radio_queue_failed = false;
 			atomic_inc(&radio_duplicates);
 			continue;
 		}
 
-		if (*previous_valid && !sequence_newer && !same_sequence_retry) {
+		if (previous_radio_valid && !sequence_newer && !same_sequence_retry) {
 			atomic_inc(&radio_duplicates);
 			continue;
 		}
 
 		if (queue_hid_report(&packet)) {
-			*previous_valid = true;
-			*previous_sequence = packet.sequence;
-			*previous_queue_failed = false;
-			memcpy(previous_data, packet.data, INPUT_DATA_SIZE);
+			previous_radio_valid = true;
+			previous_radio_sequence = packet.sequence;
+			previous_radio_queue_failed = false;
 			if (packet.type == LINK_TYPE_KEYBOARD) {
+				previous_keyboard_valid = true;
+				memcpy(previous_keyboard, packet.data, INPUT_DATA_SIZE);
 				atomic_set(&keyboard_watchdog_released, 0);
+			} else if (packet.type == LINK_TYPE_CONSUMER) {
+				previous_consumer_valid = true;
+				memcpy(previous_consumer, packet.data, INPUT_DATA_SIZE);
 			}
 		} else {
-			*previous_valid = true;
-			*previous_sequence = packet.sequence;
-			*previous_queue_failed = true;
+			previous_radio_valid = true;
+			previous_radio_sequence = packet.sequence;
+			previous_radio_queue_failed = true;
 		}
 	}
 }
