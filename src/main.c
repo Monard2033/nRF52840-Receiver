@@ -38,10 +38,17 @@ LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 #define HID_REPORT_ID_CONSUMER 0x02U
 #define HID_REPORT_ID_BATTERY  0x03U
 #define HID_REPORT_ID_DFU      0x04U
+#define HID_REPORT_ID_TRACE    0x05U
 #define HID_FEATURE_PAYLOAD_LEN 8U
 #define HID_FEATURE_REPORT_LEN  (1U + HID_FEATURE_PAYLOAD_LEN)
 #define DFU_FEATURE_PAYLOAD_LEN 8U
 #define DFU_FEATURE_REPORT_LEN  (1U + DFU_FEATURE_PAYLOAD_LEN)
+#define TRACE_FEATURE_PAYLOAD_LEN 20U
+#define TRACE_FEATURE_REPORT_LEN  (1U + TRACE_FEATURE_PAYLOAD_LEN)
+#define TRACE_QUEUE_DEPTH       256U
+#define TRACE_CMD_CLEAR         0x01U
+#define TRACE_CMD_FREEZE        0x02U
+#define TRACE_CMD_RESUME        0x03U
 
 #define LINK_TYPE_DFU_START     0x10U
 #define LINK_TYPE_DFU_DATA      0x11U
@@ -80,6 +87,31 @@ struct link_ack_frame {
 } __packed;
 
 BUILD_ASSERT(sizeof(struct link_ack_frame) == 12U);
+
+enum trace_stage {
+	TRACE_STAGE_NONE = 0,
+	TRACE_STAGE_ESB_RX = 1,
+	TRACE_STAGE_HID_QUEUED = 2,
+	TRACE_STAGE_HID_QUEUE_OVERFLOW = 3,
+	TRACE_STAGE_DUPLICATE_DROP = 4,
+	TRACE_STAGE_SEQUENCE_DROP = 5,
+	TRACE_STAGE_USB_NOT_READY_DROP = 6,
+	TRACE_STAGE_HID_SUBMIT_OK = 7,
+	TRACE_STAGE_HID_SUBMIT_BUSY = 8,
+	TRACE_STAGE_HID_SUBMIT_ERROR = 9,
+	TRACE_STAGE_HID_COMPLETE = 10,
+};
+
+struct trace_entry {
+	uint32_t timestamp_ms;
+	uint8_t stage;
+	uint8_t packet_type;
+	uint8_t sequence;
+	int8_t result;
+	uint8_t data[INPUT_DATA_SIZE];
+} __packed;
+
+BUILD_ASSERT(sizeof(struct trace_entry) == 16U);
 
 K_MSGQ_DEFINE(hid_report_queue, sizeof(struct link_input_packet),
 	      HID_QUEUE_DEPTH, sizeof(uint32_t));
@@ -169,6 +201,21 @@ static const uint8_t hid_report_descriptor[] = {
 	0x29, DFU_FEATURE_PAYLOAD_LEN,
 	0xB1, 0x02,
 	0xC0,
+
+	/* Diagnostic-only, read-on-demand trace record (ID 5). No reports are
+	 * emitted autonomously, so this cannot add traffic to the input path. */
+	0x06, 0x02, 0xFF,
+	0x09, 0x01,
+	0xA1, 0x01,
+	0x85, HID_REPORT_ID_TRACE,
+	0x15, 0x00,
+	0x26, 0xFF, 0x00,
+	0x75, 0x08,
+	0x95, TRACE_FEATURE_PAYLOAD_LEN,
+	0x19, 0x01,
+	0x29, TRACE_FEATURE_PAYLOAD_LEN,
+	0xB1, 0x02,
+	0xC0,
 };
 static const struct device *hid_device;
 static atomic_t usb_configured;
@@ -203,6 +250,16 @@ static bool windows_led_valid;
 static atomic_t led_ack_pending;
 static atomic_t led_ack_dirty;
 
+static struct k_spinlock trace_lock;
+static struct trace_entry trace_queue[TRACE_QUEUE_DEPTH];
+static uint16_t trace_head;
+static uint16_t trace_tail;
+static uint16_t trace_count;
+static uint16_t trace_overwrites;
+static bool trace_frozen;
+static struct link_input_packet trace_inflight;
+static bool trace_inflight_valid;
+
 static struct k_spinlock battery_cache_lock;
 static uint8_t battery_percentage;
 static uint8_t battery_state;
@@ -219,6 +276,67 @@ static uint8_t dfu_current_status = DFU_STATUS_IDLE;
 static uint8_t dfu_progress_percent = 0;
 static uint16_t dfu_last_offset_div_4 = 0;
 static uint8_t dfu_feature_report[DFU_FEATURE_REPORT_LEN];
+
+static void trace_record(uint8_t stage,
+			 const struct link_input_packet *packet, int result)
+{
+	struct trace_entry entry = {
+		.timestamp_ms = k_uptime_get_32(),
+		.stage = stage,
+		.packet_type = packet != NULL ? packet->type : 0U,
+		.sequence = packet != NULL ? packet->sequence : 0U,
+		.result = (int8_t)CLAMP(result, INT8_MIN, INT8_MAX),
+	};
+
+	if (packet != NULL) {
+		memcpy(entry.data, packet->data, sizeof(entry.data));
+	}
+
+	k_spinlock_key_t key = k_spin_lock(&trace_lock);
+	if (!trace_frozen) {
+		if (trace_count == TRACE_QUEUE_DEPTH) {
+			trace_tail = (uint16_t)((trace_tail + 1U) % TRACE_QUEUE_DEPTH);
+			trace_count--;
+			trace_overwrites++;
+		}
+		trace_queue[trace_head] = entry;
+		trace_head = (uint16_t)((trace_head + 1U) % TRACE_QUEUE_DEPTH);
+		trace_count++;
+	}
+	k_spin_unlock(&trace_lock, key);
+}
+
+static void trace_inflight_prepare(const struct link_input_packet *packet)
+{
+	k_spinlock_key_t key = k_spin_lock(&trace_lock);
+	trace_inflight = *packet;
+	trace_inflight_valid = true;
+	k_spin_unlock(&trace_lock, key);
+}
+
+static void trace_inflight_cancel(void)
+{
+	k_spinlock_key_t key = k_spin_lock(&trace_lock);
+	trace_inflight_valid = false;
+	k_spin_unlock(&trace_lock, key);
+}
+
+static void trace_record_inflight_complete(void)
+{
+	struct link_input_packet packet;
+	bool valid;
+	k_spinlock_key_t key = k_spin_lock(&trace_lock);
+	valid = trace_inflight_valid;
+	if (valid) {
+		packet = trace_inflight;
+		trace_inflight_valid = false;
+	}
+	k_spin_unlock(&trace_lock, key);
+
+	if (valid) {
+		trace_record(TRACE_STAGE_HID_COMPLETE, &packet, 0);
+	}
+}
 
 /*
  * The ESB event handler runs in interrupt context. It may use a message queue
@@ -237,6 +355,7 @@ static bool queue_hid_report(const struct link_input_packet *packet)
 	struct link_input_packet discarded;
 
 	atomic_inc(&hid_queue_overruns);
+	trace_record(TRACE_STAGE_HID_QUEUE_OVERFLOW, packet, -ENOSPC);
 	if (k_msgq_get(&hid_report_queue, &discarded, K_NO_WAIT) == 0) {
 		return k_msgq_put(&hid_report_queue, packet, K_NO_WAIT) == 0;
 	}
@@ -395,6 +514,8 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			continue;
 		}
 
+		trace_record(TRACE_STAGE_ESB_RX, &packet, 0);
+
 		bool *previous_valid = packet.type == LINK_TYPE_KEYBOARD ?
 			&previous_keyboard_valid : &previous_consumer_valid;
 		bool *previous_queue_failed = packet.type == LINK_TYPE_KEYBOARD ?
@@ -419,15 +540,18 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			*previous_sequence = packet.sequence;
 			*previous_queue_failed = false;
 			atomic_inc(&radio_duplicates);
+			trace_record(TRACE_STAGE_DUPLICATE_DROP, &packet, 0);
 			continue;
 		}
 
 		if (*previous_valid && !sequence_newer && !same_sequence_retry) {
 			atomic_inc(&radio_duplicates);
+			trace_record(TRACE_STAGE_SEQUENCE_DROP, &packet, 0);
 			continue;
 		}
 
 		if (queue_hid_report(&packet)) {
+			trace_record(TRACE_STAGE_HID_QUEUED, &packet, 0);
 			*previous_valid = true;
 			*previous_sequence = packet.sequence;
 			*previous_queue_failed = false;
@@ -492,6 +616,7 @@ static int esb_initialize(void)
 
 static uint8_t hid_tx_buffer[1U + INPUT_DATA_SIZE];
 static uint8_t battery_feature_report[HID_FEATURE_REPORT_LEN];
+static uint8_t trace_feature_report[TRACE_FEATURE_REPORT_LEN];
 
 static void battery_feature_build(uint8_t report[HID_FEATURE_REPORT_LEN])
 {
@@ -512,6 +637,37 @@ static void battery_feature_build(uint8_t report[HID_FEATURE_REPORT_LEN])
 	payload[6] = (uint8_t)age_seconds;
 	payload[7] = (uint8_t)(age_seconds >> 8);
 	k_spin_unlock(&battery_cache_lock, key);
+}
+
+static void trace_feature_build(uint8_t report[TRACE_FEATURE_REPORT_LEN])
+{
+	struct trace_entry entry = { 0 };
+	bool valid = false;
+	uint8_t remaining;
+	uint8_t overwrites;
+	bool frozen;
+	k_spinlock_key_t key = k_spin_lock(&trace_lock);
+
+	if (trace_count != 0U) {
+		entry = trace_queue[trace_tail];
+		trace_tail = (uint16_t)((trace_tail + 1U) % TRACE_QUEUE_DEPTH);
+		trace_count--;
+		valid = true;
+	}
+	remaining = (uint8_t)MIN(trace_count, UINT8_MAX);
+	overwrites = (uint8_t)MIN(trace_overwrites, UINT8_MAX);
+	frozen = trace_frozen;
+	k_spin_unlock(&trace_lock, key);
+
+	memset(report, 0, TRACE_FEATURE_REPORT_LEN);
+	report[0] = HID_REPORT_ID_TRACE;
+	report[1] = 1U; /* Trace protocol version. */
+	report[2] = (valid ? 0x01U : 0U) | (frozen ? 0x02U : 0U);
+	report[3] = remaining;
+	report[4] = overwrites;
+	if (valid) {
+		memcpy(&report[5], &entry, sizeof(entry));
+	}
 }
 
 static int hid_get_report(const struct device *dev,
@@ -544,6 +700,13 @@ static int hid_get_report(const struct device *dev,
 		k_spin_unlock(&dfu_state_lock, key);
 		*data = dfu_feature_report;
 		*len = sizeof(dfu_feature_report);
+		return 0;
+	}
+
+	if (report_type == 3U && report_id == HID_REPORT_ID_TRACE) {
+		trace_feature_build(trace_feature_report);
+		*data = trace_feature_report;
+		*len = sizeof(trace_feature_report);
 		return 0;
 	}
 
@@ -596,12 +759,40 @@ static int hid_set_report(const struct device *dev,
 		return 0;
 	}
 
+	if (report_type == 3U && report_id == HID_REPORT_ID_TRACE &&
+	    *len >= 1 && *data != NULL) {
+		uint8_t const *const report = *data;
+		uint8_t const command = (*len >= TRACE_FEATURE_REPORT_LEN &&
+			report[0] == HID_REPORT_ID_TRACE) ? report[1] : report[0];
+		k_spinlock_key_t key = k_spin_lock(&trace_lock);
+		switch (command) {
+		case TRACE_CMD_CLEAR:
+			trace_head = 0U;
+			trace_tail = 0U;
+			trace_count = 0U;
+			trace_overwrites = 0U;
+			break;
+		case TRACE_CMD_FREEZE:
+			trace_frozen = true;
+			break;
+		case TRACE_CMD_RESUME:
+			trace_frozen = false;
+			break;
+		default:
+			k_spin_unlock(&trace_lock, key);
+			return -EINVAL;
+		}
+		k_spin_unlock(&trace_lock, key);
+		return 0;
+	}
+
 	return -ENOTSUP;
 }
 
 static void hid_int_in_ready(const struct device *dev)
 {
 	ARG_UNUSED(dev);
+	trace_record_inflight_complete();
 	k_sem_give(&hid_in_idle);
 }
 
@@ -670,7 +861,8 @@ static bool usb_hid_ready(void)
 	       atomic_get(&usb_suspended) == 0;
 }
 
-static int send_hid_report(const uint8_t *report, size_t report_size)
+static int send_hid_report(const uint8_t *report, size_t report_size,
+			   const struct link_input_packet *trace_packet)
 {
 	if (!usb_hid_ready()) {
 		return -ENOTCONN;
@@ -682,37 +874,40 @@ static int send_hid_report(const uint8_t *report, size_t report_size)
 		return -EBUSY;
 	}
 
+	trace_inflight_prepare(trace_packet);
 	memcpy(hid_tx_buffer, report, report_size);
 	int const err = hid_int_ep_write(hid_device, hid_tx_buffer,
 					 report_size, NULL);
 	if (err != 0) {
+		trace_inflight_cancel();
 		k_sem_give(&hid_in_idle);
 		atomic_inc(&hid_write_errors);
 		return err;
 	}
 
+	trace_record(TRACE_STAGE_HID_SUBMIT_OK, trace_packet, 0);
 	atomic_inc(&hid_reports_sent);
 	return 0;
 }
 
-static int send_keyboard_report(const uint8_t data[INPUT_DATA_SIZE])
+static int send_keyboard_report(const struct link_input_packet *packet)
 {
 	uint8_t report[1U + INPUT_DATA_SIZE];
 
 	report[0] = HID_REPORT_ID_KEYBOARD;
-	memcpy(&report[1], data, INPUT_DATA_SIZE);
-	return send_hid_report(report, sizeof(report));
+	memcpy(&report[1], packet->data, INPUT_DATA_SIZE);
+	return send_hid_report(report, sizeof(report), packet);
 }
 
-static int send_consumer_report(const uint8_t data[INPUT_DATA_SIZE])
+static int send_consumer_report(const struct link_input_packet *packet)
 {
 	const uint8_t report[] = {
 		HID_REPORT_ID_CONSUMER,
-		data[0],
-		data[1],
+		packet->data[0],
+		packet->data[1],
 	};
 
-	return send_hid_report(report, sizeof(report));
+	return send_hid_report(report, sizeof(report), packet);
 }
 
 static int usb_hid_initialize(void)
@@ -771,6 +966,7 @@ int main(void)
 {
 	struct link_input_packet hid_pending = { 0 };
 	bool hid_pending_valid = false;
+	bool hid_pending_failure_logged = false;
 	int err;
 
 	LOG_INF("Starting ESB-to-USB keyboard and consumer-control receiver");
@@ -808,9 +1004,11 @@ int main(void)
 			 */
 			while (k_msgq_get(&hid_report_queue, &queued,
 					  K_NO_WAIT) == 0) {
-				/* Input transitions are not replayed after USB reconnect. */
+				trace_record(TRACE_STAGE_USB_NOT_READY_DROP, &queued,
+					     -ENOTCONN);
 			}
 			hid_pending_valid = false;
+			hid_pending_failure_logged = false;
 			k_msleep(1);
 			continue;
 		}
@@ -819,15 +1017,23 @@ int main(void)
 		    k_msgq_get(&hid_report_queue, &queued, K_NO_WAIT) == 0) {
 			hid_pending = queued;
 			hid_pending_valid = true;
+			hid_pending_failure_logged = false;
 		}
 
 		if (hid_pending_valid) {
 			int const send_result = hid_pending.type == LINK_TYPE_KEYBOARD ?
-				send_keyboard_report(hid_pending.data) :
-				send_consumer_report(hid_pending.data);
+				send_keyboard_report(&hid_pending) :
+				send_consumer_report(&hid_pending);
 
 			if (send_result == 0) {
 				hid_pending_valid = false;
+				hid_pending_failure_logged = false;
+			} else if (!hid_pending_failure_logged) {
+				trace_record(send_result == -EBUSY ?
+					TRACE_STAGE_HID_SUBMIT_BUSY :
+					TRACE_STAGE_HID_SUBMIT_ERROR,
+					&hid_pending, send_result);
+				hid_pending_failure_logged = true;
 			}
 		}
 
