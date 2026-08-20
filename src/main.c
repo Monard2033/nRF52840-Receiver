@@ -332,18 +332,13 @@ static bool receiver_queue_led_ack(void)
 
 static void receiver_ack_task(void)
 {
-	/* esb_write_payload() changes the ESB ACK queue and must not run from the
-	 * ESB event IRQ. Collapse repeated packets to one latest-state ACK. */
-	if (atomic_cas(&led_ack_pending, 1, 0) &&
-	    !receiver_queue_led_ack()) {
-		atomic_set(&led_ack_pending, 1);
+	if (atomic_cas(&led_ack_pending, 1, 0)) {
+		(void)receiver_queue_led_ack();
 	}
 }
 
 static void receiver_esb_event_handler(const struct esb_evt *event)
 {
-	bool ack_needed = false;
-
 	if (event->evt_id != ESB_EVENT_RX_RECEIVED) {
 		return;
 	}
@@ -372,7 +367,7 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			dfu_last_offset_div_4 = (uint16_t)packet.data[2] |
 				((uint16_t)packet.data[3] << 8);
 			k_spin_unlock(&dfu_state_lock, key);
-			ack_needed = true;
+			atomic_set(&led_ack_pending, 1);
 			continue;
 		}
 
@@ -381,7 +376,6 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 				atomic_inc(&radio_bad_packets);
 				continue;
 			}
-			ack_needed = true;
 			battery_cache_update(&packet);
 			continue;
 		}
@@ -391,11 +385,8 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 				atomic_inc(&radio_bad_packets);
 				continue;
 			}
-			ack_needed = true;
 			continue;
 		}
-
-		ack_needed = true;
 
 		if (packet.type == LINK_TYPE_KEYBOARD) {
 			atomic_set(&last_keyboard_packet_ms, k_uptime_get_32());
@@ -448,10 +439,6 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			*previous_sequence = packet.sequence;
 			*previous_queue_failed = true;
 		}
-	}
-
-	if (ack_needed) {
-		atomic_set(&led_ack_pending, 1);
 	}
 }
 
