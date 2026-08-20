@@ -207,6 +207,7 @@ static uint8_t windows_led_sequence;
 static uint8_t windows_led_epoch;
 static bool windows_led_valid;
 static atomic_t led_ack_pending;
+static atomic_t battery_poll_requested;
 
 static struct k_spinlock battery_cache_lock;
 static uint8_t battery_percentage;
@@ -316,7 +317,8 @@ static bool receiver_queue_led_ack(void)
 		k_spinlock_key_t key = k_spin_lock(&led_state_lock);
 		ack.sequence = windows_led_sequence;
 		ack.data[0] = windows_led_state;
-		ack.data[1] = windows_led_valid ? 0x01U : 0x00U;
+		ack.data[1] = (windows_led_valid ? 0x01U : 0x00U) |
+			(atomic_cas(&battery_poll_requested, 1, 0) ? 0x02U : 0x00U);
 		ack.data[2] = windows_led_epoch;
 		k_spin_unlock(&led_state_lock, key);
 	}
@@ -599,6 +601,12 @@ static int hid_set_report(const struct device *dev,
 		dfu_ack_active = true;
 		dfu_current_status = DFU_STATUS_BUSY;
 		k_spin_unlock(&dfu_state_lock, key);
+		atomic_set(&led_ack_pending, 1);
+		return 0;
+	}
+
+	if (report_type == 3U && report_id == HID_REPORT_ID_BATTERY) {
+		atomic_set(&battery_poll_requested, 1);
 		atomic_set(&led_ack_pending, 1);
 		return 0;
 	}
