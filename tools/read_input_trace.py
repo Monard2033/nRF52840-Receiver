@@ -165,7 +165,9 @@ def find_receiver() -> int | None:
             )
             if handle == INVALID_HANDLE_VALUE:
                 continue
-            if "vid_1b4f&pid_0001" in path.lower():
+            normalized_path = path.lower()
+            if ("vid_1b4f&pid_0001" in normalized_path and
+                    "&col05" in normalized_path):
                 return handle
             kernel32.CloseHandle(handle)
     finally:
