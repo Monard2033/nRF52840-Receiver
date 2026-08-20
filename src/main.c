@@ -189,7 +189,17 @@ static atomic_t hid_queue_overruns;
 static atomic_t hid_reports_sent;
 static atomic_t hid_write_errors;
 static atomic_t last_keyboard_packet_ms;
+static atomic_t last_consumer_packet_ms;
 static atomic_t keyboard_watchdog_released;
+
+static bool previous_keyboard_valid;
+static bool previous_consumer_valid;
+static bool previous_keyboard_queue_failed;
+static bool previous_consumer_queue_failed;
+static uint8_t previous_keyboard[INPUT_DATA_SIZE];
+static uint8_t previous_consumer[INPUT_DATA_SIZE];
+static uint8_t previous_keyboard_sequence;
+static uint8_t previous_consumer_sequence;
 
 static struct k_spinlock led_state_lock;
 static uint8_t windows_led_state;
@@ -330,14 +340,6 @@ static void receiver_ack_task(void)
 
 static void receiver_esb_event_handler(const struct esb_evt *event)
 {
-	static bool previous_keyboard_valid;
-	static bool previous_consumer_valid;
-	static bool previous_keyboard_queue_failed;
-	static bool previous_consumer_queue_failed;
-	static uint8_t previous_keyboard[INPUT_DATA_SIZE];
-	static uint8_t previous_consumer[INPUT_DATA_SIZE];
-	static uint8_t previous_keyboard_sequence;
-	static uint8_t previous_consumer_sequence;
 	bool ack_needed = false;
 
 	if (event->evt_id != ESB_EVENT_RX_RECEIVED) {
@@ -395,6 +397,8 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 
 		if (packet.type == LINK_TYPE_KEYBOARD) {
 			atomic_set(&last_keyboard_packet_ms, k_uptime_get_32());
+		} else if (packet.type == LINK_TYPE_CONSUMER) {
+			atomic_set(&last_consumer_packet_ms, k_uptime_get_32());
 		}
 
 		bool *previous_valid = packet.type == LINK_TYPE_KEYBOARD ?
@@ -842,6 +846,15 @@ int main(void)
 			hid_pending.sequence = 0;
 			memcpy(hid_pending.data, current_keyboard,
 			       sizeof(hid_pending.data));
+			hid_pending_valid = true;
+		}
+
+		if (previous_consumer_valid && (previous_consumer[0] != 0 || previous_consumer[1] != 0) &&
+		    (uint32_t)(now - (uint32_t)atomic_get(&last_consumer_packet_ms)) >= 1000U && !hid_pending_valid) {
+			memset(previous_consumer, 0, sizeof(previous_consumer));
+			hid_pending.type = LINK_TYPE_CONSUMER;
+			hid_pending.sequence = 0;
+			memset(hid_pending.data, 0, sizeof(hid_pending.data));
 			hid_pending_valid = true;
 		}
 
