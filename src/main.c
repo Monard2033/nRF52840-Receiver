@@ -33,7 +33,7 @@ LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 #define LINK_CONTROL_SESSION_RESET 0x03U
 #define LINK_ACK_MAGIC         0x5AU
 #define LINK_ACK_TYPE_LOCK_STATE 0x01U
-#define LINK_RF_CHANNEL        80U
+#define LINK_RF_CHANNEL        90U
 #define HID_QUEUE_DEPTH        256U
 #define HID_REPORT_ID_KEYBOARD 0x01U
 #define HID_REPORT_ID_CONSUMER 0x02U
@@ -223,6 +223,7 @@ static const uint8_t hid_report_descriptor[] = {
 static const struct device *hid_device;
 static atomic_t usb_configured;
 static atomic_t usb_suspended;
+static atomic_t last_rx_uptime_ms;
 
 static struct esb_payload esb_rx_payload;
 static struct esb_config esb_config = ESB_DEFAULT_CONFIG;
@@ -437,11 +438,6 @@ static bool receiver_queue_led_ack(void)
 	k_spinlock_key_t dfu_key = k_spin_lock(&dfu_state_lock);
 	if (dfu_ack_active) {
 		ack = dfu_pending_ack;
-		/* DIAGNOSTIC A/B: restore the proven one-shot delivery of the
-		 * Gemini-era receiver instead of holding the command for
-		 * end-to-end confirmation. If reverse ACKs flow with this, the
-		 * per-RX-event re-queue flood is the root cause. */
-		dfu_ack_active = false;
 		k_spin_unlock(&dfu_state_lock, dfu_key);
 	} else {
 		k_spin_unlock(&dfu_state_lock, dfu_key);
@@ -458,6 +454,7 @@ static bool receiver_queue_led_ack(void)
 	payload.pipe = 0;
 	payload.noack = false;
 	memcpy(payload.data, &ack, sizeof(ack));
+	(void)esb_flush_tx();
 	bool const queued = esb_write_payload(&payload) == 0;
 	if (!queued) {
 		/* Preserve both the pending DFU command and the retry request. */
@@ -545,6 +542,7 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 		}
 
 		memcpy(&packet, esb_rx_payload.data, sizeof(packet));
+		atomic_set(&last_rx_uptime_ms, (long)k_uptime_get_32());
 
 		if (packet.magic != LINK_MAGIC || packet.version != LINK_VERSION) {
 			atomic_inc(&radio_bad_packets);
@@ -554,7 +552,11 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 		/* DIAGNOSTIC A/B: skip the per-RX-event re-queue of a pending DFU
 		 * command (Gemini-era behavior) while investigating the reverse
 		 * ACK path. */
-		if (atomic_get(&led_ack_dirty) != 0) {
+		k_spinlock_key_t pending_key = k_spin_lock(&dfu_state_lock);
+		bool const command_pending = dfu_ack_active;
+		k_spin_unlock(&dfu_state_lock, pending_key);
+
+		if (atomic_get(&led_ack_dirty) != 0 || command_pending) {
 			atomic_set(&led_ack_pending, 1);
 		}
 
@@ -621,11 +623,12 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			packet.sequence == *previous_sequence && *previous_queue_failed;
 
 		/*
-		 * Keyboard and Consumer packets are absolute states: if the data is
-		 * identical to the current state, it is a keepalive/duplicate, so
-		 * drop it and do NOT re-queue it to Windows.
+		 * Keyboard packets are absolute states: if the data is identical to
+		 * the current state, it is a keepalive/duplicate, so drop it.
+		 * Consumer usages are discrete event transitions (e.g. repeated volume
+		 * clicks): accept them whenever sequence_newer is true.
 		 */
-		if (*previous_valid && !same_sequence_retry &&
+		if (packet.type == LINK_TYPE_KEYBOARD && *previous_valid && !same_sequence_retry &&
 		    memcmp(packet.data, previous_data, INPUT_DATA_SIZE) == 0) {
 			*previous_sequence = packet.sequence;
 			*previous_queue_failed = false;
@@ -838,15 +841,18 @@ static int hid_set_report(const struct device *dev,
 			return -EINVAL;
 		}
 		k_spinlock_key_t key = k_spin_lock(&dfu_state_lock);
-		if (dfu_ack_active) {
+		if (dfu_ack_active && payload[0] != LINK_TYPE_DFU_START &&
+		    dfu_pending_ack.data[1] == payload[1]) {
 			bool const duplicate =
 				memcmp(dfu_pending_ack.data, payload,
 				       INPUT_DATA_SIZE) == 0;
-			k_spin_unlock(&dfu_state_lock, key);
 			if (duplicate) {
+				k_spin_unlock(&dfu_state_lock, key);
 				atomic_set(&led_ack_pending, 1);
+				(void)receiver_queue_led_ack();
 				return 0;
 			}
+			k_spin_unlock(&dfu_state_lock, key);
 			return -EBUSY;
 		}
 		dfu_pending_ack.magic = LINK_ACK_MAGIC;
@@ -866,6 +872,7 @@ static int hid_set_report(const struct device *dev,
 		dfu_status_value = 0;
 		k_spin_unlock(&dfu_state_lock, key);
 		atomic_set(&led_ack_pending, 1);
+		(void)receiver_queue_led_ack();
 		return 0;
 	}
 
