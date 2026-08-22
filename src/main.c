@@ -34,7 +34,7 @@ LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 #define LINK_ACK_MAGIC         0x5AU
 #define LINK_ACK_TYPE_LOCK_STATE 0x01U
 #define LINK_RF_CHANNEL        80U
-#define HID_QUEUE_DEPTH        128U
+#define HID_QUEUE_DEPTH        256U
 #define HID_REPORT_ID_KEYBOARD 0x01U
 #define HID_REPORT_ID_CONSUMER 0x02U
 #define HID_REPORT_ID_BATTERY  0x03U
@@ -587,12 +587,11 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			packet.sequence == *previous_sequence && *previous_queue_failed;
 
 		/*
-		 * Keyboard packets are absolute states: if the data is identical to
-		 * the current keyboard state, it is a keepalive/duplicate, so drop it
-		 * and do NOT re-queue it to Windows.
+		 * Keyboard and Consumer packets are absolute states: if the data is
+		 * identical to the current state, it is a keepalive/duplicate, so
+		 * drop it and do NOT re-queue it to Windows.
 		 */
 		if (*previous_valid && !same_sequence_retry &&
-		    packet.type == LINK_TYPE_KEYBOARD &&
 		    memcmp(packet.data, previous_data, INPUT_DATA_SIZE) == 0) {
 			*previous_sequence = packet.sequence;
 			*previous_queue_failed = false;
@@ -1026,7 +1025,6 @@ int main(void)
 	bool hid_pending_failure_logged = false;
 	int err;
 
-	LOG_INF("Starting ESB-to-USB keyboard and consumer-control receiver");
 	windows_led_epoch = (uint8_t)k_cycle_get_32();
 
 	/*
