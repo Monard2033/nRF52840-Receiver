@@ -454,7 +454,6 @@ static bool receiver_queue_led_ack(void)
 	payload.pipe = 0;
 	payload.noack = false;
 	memcpy(payload.data, &ack, sizeof(ack));
-	(void)esb_flush_tx();
 	bool const queued = esb_write_payload(&payload) == 0;
 	if (!queued) {
 		/* Preserve both the pending DFU command and the retry request. */

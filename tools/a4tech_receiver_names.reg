@@ -1,0 +1,45 @@
+﻿Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\USB\VID_1B4F&PID_0001\3D25C8DD126ACEA7]
+"FriendlyName"="A4TECH USB Receiver"
+"DeviceDesc"="A4TECH USB Receiver"
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\HID\VID_1B4F&PID_0001&Col01\6&22b9b4cd&0&0000]
+"FriendlyName"="A4TECH Bloody Gaming Wireless Keyboard"
+"DeviceDesc"="A4TECH Bloody Gaming Wireless Keyboard"
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\HID\VID_1B4F&PID_0001&Col02\6&22b9b4cd&0&0001]
+"FriendlyName"="A4TECH Consumer Media Control"
+"DeviceDesc"="A4TECH Consumer Media Control"
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\HID\VID_1B4F&PID_0001&Col03\6&22b9b4cd&0&0002]
+"FriendlyName"="A4TECH Battery & Power Management"
+"DeviceDesc"="A4TECH Battery & Power Management"
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\HID\VID_1B4F&PID_0001&Col04\6&22b9b4cd&0&0003]
+"FriendlyName"="A4TECH Wireless Configuration Interface"
+"DeviceDesc"="A4TECH Wireless Configuration Interface"
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\HID\VID_1B4F&PID_0001&Col05\6&22b9b4cd&0&0004]
+"FriendlyName"="A4TECH 1000Hz Ultra-Fast Diagnostic Interface"
+"DeviceDesc"="A4TECH 1000Hz Ultra-Fast Diagnostic Interface"
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\HID\VID_1B4F&PID_0001&MI_02&Col01\7&31449e67&0&0000]
+"FriendlyName"="A4TECH Bloody Gaming Wireless Keyboard"
+"DeviceDesc"="A4TECH Bloody Gaming Wireless Keyboard"
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\HID\VID_1B4F&PID_0001&MI_02&Col02\7&31449e67&0&0001]
+"FriendlyName"="A4TECH Consumer Media Control"
+"DeviceDesc"="A4TECH Consumer Media Control"
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\HID\VID_1B4F&PID_0001&MI_02&Col03\7&31449e67&0&0002]
+"FriendlyName"="A4TECH Battery & Power Management"
+"DeviceDesc"="A4TECH Battery & Power Management"
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\HID\VID_1B4F&PID_0001&MI_02&Col04\7&31449e67&0&0003]
+"FriendlyName"="A4TECH Wireless Configuration Interface"
+"DeviceDesc"="A4TECH Wireless Configuration Interface"
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\HID\VID_1B4F&PID_0001&MI_02&Col05\7&31449e67&0&0004]
+"FriendlyName"="A4TECH 1000Hz Ultra-Fast Diagnostic Interface"
+"DeviceDesc"="A4TECH 1000Hz Ultra-Fast Diagnostic Interface"
