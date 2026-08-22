@@ -458,6 +458,16 @@ static bool receiver_queue_led_ack(void)
 		/* Preserve both the pending DFU command and the retry request. */
 		atomic_set(&led_ack_pending, 1);
 	}
+	/* OTA diagnostic: prove whether reverse ACK payloads are accepted by
+	 * the ESB stack and whether a DFU command is being held. */
+	static int64_t diag_last_ack_log;
+	int64_t const diag_now = k_uptime_get();
+	if (queued || (diag_now - diag_last_ack_log) > 1000) {
+		diag_last_ack_log = diag_now;
+		LOG_INF("ackq dfu_held=%u queued=%u led=%02x",
+			ack.type == LINK_ACK_TYPE_DFU ? 1u : 0u, queued ? 1u : 0u,
+			ack.data[0]);
+	}
 	return queued;
 }
 
@@ -562,6 +572,12 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 				dfu_ack_active = false;
 			}
 			k_spin_unlock(&dfu_state_lock, key);
+			LOG_INF("dfu_status st=%u sess=%u tok=%u val=%u",
+				packet.data[0], packet.data[1], packet.data[2],
+				(uint32_t)packet.data[4] |
+					((uint32_t)packet.data[5] << 8) |
+					((uint32_t)packet.data[6] << 16) |
+					((uint32_t)packet.data[7] << 24));
 			atomic_set(&led_ack_pending, 1);
 			continue;
 		}
@@ -836,6 +852,10 @@ static int hid_set_report(const struct device *dev,
 		dfu_pending_ack.type = LINK_ACK_TYPE_DFU;
 		dfu_pending_ack.sequence = ++dfu_command_sequence;
 		memcpy(dfu_pending_ack.data, payload, INPUT_DATA_SIZE);
+		LOG_INF("dfu_cmd %02x %02x %02x %02x %02x %02x %02x %02x tok=%u",
+			payload[0], payload[1], payload[2], payload[3],
+			payload[4], payload[5], payload[6], payload[7],
+			dfu_pending_ack.sequence);
 		dfu_ack_active = true;
 		dfu_current_status = DFU_STATUS_BUSY;
 		dfu_status_session = payload[1];
