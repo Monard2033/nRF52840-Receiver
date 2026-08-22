@@ -437,6 +437,11 @@ static bool receiver_queue_led_ack(void)
 	k_spinlock_key_t dfu_key = k_spin_lock(&dfu_state_lock);
 	if (dfu_ack_active) {
 		ack = dfu_pending_ack;
+		/* DIAGNOSTIC A/B: restore the proven one-shot delivery of the
+		 * Gemini-era receiver instead of holding the command for
+		 * end-to-end confirmation. If reverse ACKs flow with this, the
+		 * per-RX-event re-queue flood is the root cause. */
+		dfu_ack_active = false;
 		k_spin_unlock(&dfu_state_lock, dfu_key);
 	} else {
 		k_spin_unlock(&dfu_state_lock, dfu_key);
@@ -546,13 +551,10 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			continue;
 		}
 
-		/* An ACK payload queued now is attached to the next PTX probe. Keep
-		 * scheduling the same command until the RP2040 status proves that it
-		 * was consumed end-to-end. */
-		k_spinlock_key_t pending_key = k_spin_lock(&dfu_state_lock);
-		bool const command_pending = dfu_ack_active;
-		k_spin_unlock(&dfu_state_lock, pending_key);
-		if (atomic_get(&led_ack_dirty) != 0 || command_pending) {
+		/* DIAGNOSTIC A/B: skip the per-RX-event re-queue of a pending DFU
+		 * command (Gemini-era behavior) while investigating the reverse
+		 * ACK path. */
+		if (atomic_get(&led_ack_dirty) != 0) {
 			atomic_set(&led_ack_pending, 1);
 		}
 
