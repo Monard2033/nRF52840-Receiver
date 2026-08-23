@@ -616,32 +616,25 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			previous_keyboard : previous_consumer;
 		uint8_t *previous_sequence = packet.type == LINK_TYPE_KEYBOARD ?
 			&previous_keyboard_sequence : &previous_consumer_sequence;
-		bool const sequence_newer = !*previous_valid ||
-			sequence_is_newer(packet.sequence, *previous_sequence);
 		bool const same_sequence_retry = *previous_valid &&
 			packet.sequence == *previous_sequence && *previous_queue_failed;
+		bool const data_changed = !*previous_valid ||
+			memcmp(packet.data, previous_data, INPUT_DATA_SIZE) != 0;
 
 		/*
-		 * Keyboard packets are absolute states: if the data is identical to
-		 * the current state, it is a keepalive/duplicate, so drop it.
-		 * Consumer usages are discrete event transitions (e.g. repeated volume
-		 * clicks): accept them whenever sequence_newer is true.
+		 * If the payload is identical to the current active state and sequence
+		 * has not changed, drop it as an ESB duplicate retransmission.
 		 */
-		if (packet.type == LINK_TYPE_KEYBOARD && *previous_valid && !same_sequence_retry &&
-		    memcmp(packet.data, previous_data, INPUT_DATA_SIZE) == 0) {
-			*previous_sequence = packet.sequence;
-			*previous_queue_failed = false;
+		if (!data_changed && packet.sequence == *previous_sequence && !same_sequence_retry) {
 			atomic_inc(&radio_duplicates);
 			trace_record(TRACE_STAGE_DUPLICATE_DROP, &packet, 0);
 			continue;
 		}
 
-		if (*previous_valid && !sequence_newer && !same_sequence_retry) {
-			atomic_inc(&radio_duplicates);
-			trace_record(TRACE_STAGE_SEQUENCE_DROP, &packet, 0);
-			continue;
-		}
-
+		/*
+		 * Any valid state transition (key press, key release, combo, consumer action)
+		 * is immediately accepted and delivered to Windows.
+		 */
 		if (queue_hid_report(&packet)) {
 			trace_record(TRACE_STAGE_HID_QUEUED, &packet, 0);
 			*previous_valid = true;
