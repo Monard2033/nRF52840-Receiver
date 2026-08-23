@@ -31,13 +31,15 @@ LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 #define LINK_TYPE_BATTERY      0x04U
 #define LINK_CONTROL_POLL_ACK  0x02U
 #define LINK_CONTROL_SESSION_RESET 0x03U
+#define LINK_CONTROL_SWITCH_CHANNEL 0x05U
 #define LINK_ACK_MAGIC         0x5AU
 #define LINK_ACK_TYPE_LOCK_STATE 0x01U
+#define LINK_ACK_TYPE_CHANNEL_CONFIRM 0x05U
 static const uint8_t channel_table[] = { 90U, 95U, 85U };
 #define CHANNEL_COUNT          ARRAY_SIZE(channel_table)
 static uint8_t current_channel_idx = 0U;
 static uint32_t last_packet_rx_uptime_ms = 0U;
-#define RX_CHANNEL_TIMEOUT_MS  15U
+#define FALLBACK_TIMEOUT_MS    1000U
 #define HID_QUEUE_DEPTH        256U
 #define HID_REPORT_ID_KEYBOARD 0x01U
 #define HID_REPORT_ID_CONSUMER 0x02U
@@ -600,6 +602,13 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 		}
 
 		if (packet.type == LINK_TYPE_CONTROL) {
+			if (packet.data[0] == LINK_CONTROL_SWITCH_CHANNEL) {
+				uint8_t const requested_channel_idx = packet.data[1] % (uint8_t)CHANNEL_COUNT;
+				current_channel_idx = requested_channel_idx;
+				(void)esb_set_rf_channel(channel_table[current_channel_idx]);
+				LOG_INF("Handshake: switched to channel %u", channel_table[current_channel_idx]);
+				continue;
+			}
 			if (packet.data[0] == LINK_CONTROL_SESSION_RESET) {
 				receiver_reset_input_session();
 				continue;
@@ -1115,6 +1124,15 @@ int main(void)
 	for (;;) {
 		struct link_input_packet queued;
 		receiver_ack_task();
+
+		uint32_t const now_ms = k_uptime_get_32();
+		if (atomic_get(&radio_ready) != 0 && current_channel_idx != 0U &&
+		    (now_ms - last_packet_rx_uptime_ms) > FALLBACK_TIMEOUT_MS) {
+			current_channel_idx = 0U;
+			(void)esb_set_rf_channel(channel_table[0]);
+			last_packet_rx_uptime_ms = now_ms;
+			LOG_INF("Fallback to Home Channel %u after silence", channel_table[0]);
+		}
 
 		if (!usb_hid_ready()) {
 			/*
