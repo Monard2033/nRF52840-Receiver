@@ -1116,14 +1116,6 @@ int main(void)
 		struct link_input_packet queued;
 		receiver_ack_task();
 
-		uint32_t const now_ms = k_uptime_get_32();
-		if (atomic_get(&radio_ready) != 0 &&
-		    (now_ms - last_packet_rx_uptime_ms) > RX_CHANNEL_TIMEOUT_MS) {
-			current_channel_idx = (current_channel_idx + 1U) % (uint8_t)CHANNEL_COUNT;
-			(void)esb_set_rf_channel(channel_table[current_channel_idx]);
-			last_packet_rx_uptime_ms = now_ms;
-		}
-
 		if (!usb_hid_ready()) {
 			/*
 			 * Retain only keyboard state while the PC is absent. Consumer
