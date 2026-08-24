@@ -369,6 +369,11 @@ static bool queue_hid_report(const struct link_input_packet *packet)
 	return false;
 }
 
+static bool sequence_is_newer(uint8_t sequence, uint8_t previous)
+{
+	return (int8_t)(sequence - previous) > 0;
+}
+
 static bool battery_packet_is_valid(const struct link_input_packet *packet)
 {
 	uint16_t const millivolts = (uint16_t)packet->data[2] |
@@ -385,14 +390,19 @@ static bool battery_packet_is_valid(const struct link_input_packet *packet)
 static void battery_cache_update(const struct link_input_packet *packet)
 {
 	k_spinlock_key_t key = k_spin_lock(&battery_cache_lock);
-	battery_percentage = packet->data[0];
-	battery_state = packet->data[1];
-	battery_millivolts = (uint16_t)packet->data[2] |
-		((uint16_t)packet->data[3] << 8);
-	battery_sequence = packet->data[4];
-	battery_flags = packet->data[5];
-	battery_last_update_ms = k_uptime_get_32();
-	battery_cache_valid = true;
+	bool const newer = !battery_cache_valid ||
+		sequence_is_newer(packet->data[4], battery_sequence);
+
+	if (newer) {
+		battery_percentage = packet->data[0];
+		battery_state = packet->data[1];
+		battery_millivolts = (uint16_t)packet->data[2] |
+			((uint16_t)packet->data[3] << 8);
+		battery_sequence = packet->data[4];
+		battery_flags = packet->data[5];
+		battery_last_update_ms = k_uptime_get_32();
+		battery_cache_valid = true;
+	}
 	k_spin_unlock(&battery_cache_lock, key);
 }
 
