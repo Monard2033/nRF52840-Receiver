@@ -30,20 +30,28 @@ LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 #define LINK_TYPE_CONTROL      0x03U
 #define LINK_TYPE_BATTERY      0x04U
 #define LINK_CONTROL_POLL_ACK  0x02U
+#define LINK_CONTROL_SESSION_RESET 0x03U
 #define LINK_ACK_MAGIC         0x5AU
 #define LINK_ACK_TYPE_LOCK_STATE 0x01U
-#define LINK_RF_CHANNEL        80U
-#define HID_QUEUE_DEPTH        128U
+#define LINK_RF_CHANNEL        90U
+#define HID_QUEUE_DEPTH        256U
 #define HID_REPORT_ID_KEYBOARD 0x01U
 #define HID_REPORT_ID_CONSUMER 0x02U
 #define HID_REPORT_ID_BATTERY  0x03U
 #define HID_REPORT_ID_DFU      0x04U
-#define KEYBOARD_LINK_TIMEOUT_MS 2000U
-#define KEYBOARD_KEEPALIVE_MS    8U
+#define HID_REPORT_ID_TRACE    0x05U
 #define HID_FEATURE_PAYLOAD_LEN 8U
 #define HID_FEATURE_REPORT_LEN  (1U + HID_FEATURE_PAYLOAD_LEN)
 #define DFU_FEATURE_PAYLOAD_LEN 8U
 #define DFU_FEATURE_REPORT_LEN  (1U + DFU_FEATURE_PAYLOAD_LEN)
+#define TRACE_FEATURE_PAYLOAD_LEN 20U
+#define TRACE_FEATURE_REPORT_LEN  (1U + TRACE_FEATURE_PAYLOAD_LEN)
+#define TRACE_QUEUE_DEPTH       256U
+#define TRACE_CMD_CLEAR         0x01U
+#define TRACE_CMD_FREEZE        0x02U
+#define TRACE_CMD_RESUME        0x03U
+#define BATTERY_VALID_MIN_MV    2800U
+#define BATTERY_VALID_MAX_MV    4300U
 
 #define LINK_TYPE_DFU_START     0x10U
 #define LINK_TYPE_DFU_DATA      0x11U
@@ -82,6 +90,31 @@ struct link_ack_frame {
 } __packed;
 
 BUILD_ASSERT(sizeof(struct link_ack_frame) == 12U);
+
+enum trace_stage {
+	TRACE_STAGE_NONE = 0,
+	TRACE_STAGE_ESB_RX = 1,
+	TRACE_STAGE_HID_QUEUED = 2,
+	TRACE_STAGE_HID_QUEUE_OVERFLOW = 3,
+	TRACE_STAGE_DUPLICATE_DROP = 4,
+	TRACE_STAGE_SEQUENCE_DROP = 5,
+	TRACE_STAGE_USB_NOT_READY_DROP = 6,
+	TRACE_STAGE_HID_SUBMIT_OK = 7,
+	TRACE_STAGE_HID_SUBMIT_BUSY = 8,
+	TRACE_STAGE_HID_SUBMIT_ERROR = 9,
+	TRACE_STAGE_HID_COMPLETE = 10,
+};
+
+struct trace_entry {
+	uint32_t timestamp_ms;
+	uint8_t stage;
+	uint8_t packet_type;
+	uint8_t sequence;
+	int8_t result;
+	uint8_t data[INPUT_DATA_SIZE];
+} __packed;
+
+BUILD_ASSERT(sizeof(struct trace_entry) == 16U);
 
 K_MSGQ_DEFINE(hid_report_queue, sizeof(struct link_input_packet),
 	      HID_QUEUE_DEPTH, sizeof(uint32_t));
@@ -171,10 +204,26 @@ static const uint8_t hid_report_descriptor[] = {
 	0x29, DFU_FEATURE_PAYLOAD_LEN,
 	0xB1, 0x02,
 	0xC0,
+
+	/* Diagnostic-only, read-on-demand trace record (ID 5). No reports are
+	 * emitted autonomously, so this cannot add traffic to the input path. */
+	0x06, 0x02, 0xFF,
+	0x09, 0x01,
+	0xA1, 0x01,
+	0x85, HID_REPORT_ID_TRACE,
+	0x15, 0x00,
+	0x26, 0xFF, 0x00,
+	0x75, 0x08,
+	0x95, TRACE_FEATURE_PAYLOAD_LEN,
+	0x19, 0x01,
+	0x29, TRACE_FEATURE_PAYLOAD_LEN,
+	0xB1, 0x02,
+	0xC0,
 };
 static const struct device *hid_device;
 static atomic_t usb_configured;
 static atomic_t usb_suspended;
+static atomic_t last_rx_uptime_ms;
 
 static struct esb_payload esb_rx_payload;
 static struct esb_config esb_config = ESB_DEFAULT_CONFIG;
@@ -188,8 +237,14 @@ static atomic_t radio_init_error;
 static atomic_t hid_queue_overruns;
 static atomic_t hid_reports_sent;
 static atomic_t hid_write_errors;
-static atomic_t last_keyboard_packet_ms;
-static atomic_t keyboard_watchdog_released;
+static bool previous_keyboard_valid;
+static bool previous_consumer_valid;
+static bool previous_keyboard_queue_failed;
+static bool previous_consumer_queue_failed;
+static uint8_t previous_keyboard[INPUT_DATA_SIZE];
+static uint8_t previous_consumer[INPUT_DATA_SIZE];
+static uint8_t previous_keyboard_sequence;
+static uint8_t previous_consumer_sequence;
 
 static struct k_spinlock led_state_lock;
 static uint8_t windows_led_state;
@@ -197,6 +252,17 @@ static uint8_t windows_led_sequence;
 static uint8_t windows_led_epoch;
 static bool windows_led_valid;
 static atomic_t led_ack_pending;
+static atomic_t led_ack_dirty;
+
+static struct k_spinlock trace_lock;
+static struct trace_entry trace_queue[TRACE_QUEUE_DEPTH];
+static uint16_t trace_head;
+static uint16_t trace_tail;
+static uint16_t trace_count;
+static uint16_t trace_overwrites;
+static bool trace_frozen;
+static struct link_input_packet trace_inflight;
+static bool trace_inflight_valid;
 
 static struct k_spinlock battery_cache_lock;
 static uint8_t battery_percentage;
@@ -211,9 +277,73 @@ static struct k_spinlock dfu_state_lock;
 static struct link_ack_frame dfu_pending_ack;
 static bool dfu_ack_active;
 static uint8_t dfu_current_status = DFU_STATUS_IDLE;
-static uint8_t dfu_progress_percent = 0;
-static uint16_t dfu_last_offset_div_4 = 0;
+static uint8_t dfu_status_session;
+static uint8_t dfu_status_token;
+static uint8_t dfu_status_detail;
+static uint32_t dfu_status_value;
+static uint8_t dfu_command_sequence;
 static uint8_t dfu_feature_report[DFU_FEATURE_REPORT_LEN];
+
+static void trace_record(uint8_t stage,
+			 const struct link_input_packet *packet, int result)
+{
+	struct trace_entry entry = {
+		.timestamp_ms = k_uptime_get_32(),
+		.stage = stage,
+		.packet_type = packet != NULL ? packet->type : 0U,
+		.sequence = packet != NULL ? packet->sequence : 0U,
+		.result = (int8_t)CLAMP(result, INT8_MIN, INT8_MAX),
+	};
+
+	if (packet != NULL) {
+		memcpy(entry.data, packet->data, sizeof(entry.data));
+	}
+
+	k_spinlock_key_t key = k_spin_lock(&trace_lock);
+	if (!trace_frozen) {
+		if (trace_count == TRACE_QUEUE_DEPTH) {
+			trace_tail = (uint16_t)((trace_tail + 1U) % TRACE_QUEUE_DEPTH);
+			trace_count--;
+			trace_overwrites++;
+		}
+		trace_queue[trace_head] = entry;
+		trace_head = (uint16_t)((trace_head + 1U) % TRACE_QUEUE_DEPTH);
+		trace_count++;
+	}
+	k_spin_unlock(&trace_lock, key);
+}
+
+static void trace_inflight_prepare(const struct link_input_packet *packet)
+{
+	k_spinlock_key_t key = k_spin_lock(&trace_lock);
+	trace_inflight = *packet;
+	trace_inflight_valid = true;
+	k_spin_unlock(&trace_lock, key);
+}
+
+static void trace_inflight_cancel(void)
+{
+	k_spinlock_key_t key = k_spin_lock(&trace_lock);
+	trace_inflight_valid = false;
+	k_spin_unlock(&trace_lock, key);
+}
+
+static void trace_record_inflight_complete(void)
+{
+	struct link_input_packet packet;
+	bool valid;
+	k_spinlock_key_t key = k_spin_lock(&trace_lock);
+	valid = trace_inflight_valid;
+	if (valid) {
+		packet = trace_inflight;
+		trace_inflight_valid = false;
+	}
+	k_spin_unlock(&trace_lock, key);
+
+	if (valid) {
+		trace_record(TRACE_STAGE_HID_COMPLETE, &packet, 0);
+	}
+}
 
 /*
  * The ESB event handler runs in interrupt context. It may use a message queue
@@ -232,6 +362,7 @@ static bool queue_hid_report(const struct link_input_packet *packet)
 	struct link_input_packet discarded;
 
 	atomic_inc(&hid_queue_overruns);
+	trace_record(TRACE_STAGE_HID_QUEUE_OVERFLOW, packet, -ENOSPC);
 	if (k_msgq_get(&hid_report_queue, &discarded, K_NO_WAIT) == 0) {
 		return k_msgq_put(&hid_report_queue, packet, K_NO_WAIT) == 0;
 	}
@@ -245,7 +376,12 @@ static bool sequence_is_newer(uint8_t sequence, uint8_t previous)
 
 static bool battery_packet_is_valid(const struct link_input_packet *packet)
 {
+	uint16_t const millivolts = (uint16_t)packet->data[2] |
+		((uint16_t)packet->data[3] << 8);
+
 	return packet->data[0] <= 100U && packet->data[1] <= 4U &&
+	       millivolts >= BATTERY_VALID_MIN_MV &&
+	       millivolts <= BATTERY_VALID_MAX_MV &&
 	       (packet->data[5] & 0x01U) != 0U &&
 	       (packet->data[5] & 0xF0U) == 0U &&
 	       packet->data[6] == 0U && packet->data[7] == 0U;
@@ -274,17 +410,20 @@ static void receiver_set_led_state(uint8_t led_state)
 {
 	led_state &= 0x07U;
 	k_spinlock_key_t key = k_spin_lock(&led_state_lock);
+	bool const changed = !windows_led_valid ||
+		windows_led_state != led_state;
 
-	if (!windows_led_valid || windows_led_state != led_state) {
+	if (changed) {
 		windows_led_state = led_state;
 		windows_led_sequence++;
 	}
 	windows_led_valid = true;
 	k_spin_unlock(&led_state_lock, key);
 
-	/* Queue the new Windows state immediately. It will be attached to the
-	 * next eligible ESB ACK without waiting for another RX handler cycle. */
-	atomic_set(&led_ack_pending, 1);
+	if (changed) {
+		atomic_set(&led_ack_dirty, 1);
+		atomic_set(&led_ack_pending, 1);
+	}
 }
 
 static bool receiver_queue_led_ack(void)
@@ -299,10 +438,10 @@ static bool receiver_queue_led_ack(void)
 	k_spinlock_key_t dfu_key = k_spin_lock(&dfu_state_lock);
 	if (dfu_ack_active) {
 		ack = dfu_pending_ack;
-		dfu_ack_active = false;
 		k_spin_unlock(&dfu_state_lock, dfu_key);
 	} else {
 		k_spin_unlock(&dfu_state_lock, dfu_key);
+		atomic_set(&led_ack_dirty, 0);
 		k_spinlock_key_t key = k_spin_lock(&led_state_lock);
 		ack.sequence = windows_led_sequence;
 		ack.data[0] = windows_led_state;
@@ -315,31 +454,78 @@ static bool receiver_queue_led_ack(void)
 	payload.pipe = 0;
 	payload.noack = false;
 	memcpy(payload.data, &ack, sizeof(ack));
-	return esb_write_payload(&payload) == 0;
+	bool const queued = esb_write_payload(&payload) == 0;
+	if (!queued) {
+		/* Preserve both the pending DFU command and the retry request. */
+		atomic_set(&led_ack_pending, 1);
+	}
+	/* OTA diagnostic: prove whether reverse ACK payloads are accepted by
+	 * the ESB stack and whether a DFU command is being held. */
+	static int64_t diag_last_ack_log;
+	int64_t const diag_now = k_uptime_get();
+	if (queued || (diag_now - diag_last_ack_log) > 1000) {
+		diag_last_ack_log = diag_now;
+		LOG_INF("ackq dfu_held=%u queued=%u led=%02x",
+			ack.type == LINK_ACK_TYPE_DFU ? 1u : 0u, queued ? 1u : 0u,
+			ack.data[0]);
+	}
+	return queued;
 }
 
 static void receiver_ack_task(void)
 {
-	/* esb_write_payload() changes the ESB ACK queue and must not run from the
-	 * ESB event IRQ. Collapse repeated packets to one latest-state ACK. */
-	if (atomic_cas(&led_ack_pending, 1, 0) &&
-	    !receiver_queue_led_ack()) {
-		atomic_set(&led_ack_pending, 1);
+	if (atomic_cas(&led_ack_pending, 1, 0)) {
+		(void)receiver_queue_led_ack();
+	}
+}
+
+static void receiver_reset_input_session(void)
+{
+	bool const keyboard_was_pressed = previous_keyboard_valid &&
+		memcmp(previous_keyboard, (uint8_t[INPUT_DATA_SIZE]){ 0 },
+		       INPUT_DATA_SIZE) != 0;
+	bool const consumer_was_pressed = previous_consumer_valid &&
+		memcmp(previous_consumer, (uint8_t[INPUT_DATA_SIZE]){ 0 },
+		       INPUT_DATA_SIZE) != 0;
+
+	previous_keyboard_valid = false;
+	previous_consumer_valid = false;
+	previous_keyboard_queue_failed = false;
+	previous_consumer_queue_failed = false;
+	previous_keyboard_sequence = 0U;
+	previous_consumer_sequence = 0U;
+	memset(previous_keyboard, 0, sizeof(previous_keyboard));
+	memset(previous_consumer, 0, sizeof(previous_consumer));
+
+	k_spinlock_key_t key = k_spin_lock(&battery_cache_lock);
+	battery_cache_valid = false;
+	battery_flags = 0U;
+	battery_sequence = 0U;
+	battery_last_update_ms = 0U;
+	k_spin_unlock(&battery_cache_lock, key);
+
+	/* Release only a state that was actually held in the previous RP2040
+	 * session. The first new real frame is then accepted regardless of seq. */
+	if (keyboard_was_pressed) {
+		struct link_input_packet const release = {
+			.magic = LINK_MAGIC,
+			.version = LINK_VERSION,
+			.type = LINK_TYPE_KEYBOARD,
+		};
+		(void)queue_hid_report(&release);
+	}
+	if (consumer_was_pressed) {
+		struct link_input_packet const release = {
+			.magic = LINK_MAGIC,
+			.version = LINK_VERSION,
+			.type = LINK_TYPE_CONSUMER,
+		};
+		(void)queue_hid_report(&release);
 	}
 }
 
 static void receiver_esb_event_handler(const struct esb_evt *event)
 {
-	static bool previous_keyboard_valid;
-	static bool previous_consumer_valid;
-	static bool previous_keyboard_queue_failed;
-	static bool previous_consumer_queue_failed;
-	static uint8_t previous_keyboard[INPUT_DATA_SIZE];
-	static uint8_t previous_consumer[INPUT_DATA_SIZE];
-	static uint8_t previous_keyboard_sequence;
-	static uint8_t previous_consumer_sequence;
-	bool ack_needed = false;
-
 	if (event->evt_id != ESB_EVENT_RX_RECEIVED) {
 		return;
 	}
@@ -355,20 +541,47 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 		}
 
 		memcpy(&packet, esb_rx_payload.data, sizeof(packet));
+		atomic_set(&last_rx_uptime_ms, (long)k_uptime_get_32());
 
 		if (packet.magic != LINK_MAGIC || packet.version != LINK_VERSION) {
 			atomic_inc(&radio_bad_packets);
 			continue;
 		}
 
+		/* DIAGNOSTIC A/B: skip the per-RX-event re-queue of a pending DFU
+		 * command (Gemini-era behavior) while investigating the reverse
+		 * ACK path. */
+		k_spinlock_key_t pending_key = k_spin_lock(&dfu_state_lock);
+		bool const command_pending = dfu_ack_active;
+		k_spin_unlock(&dfu_state_lock, pending_key);
+
+		if (atomic_get(&led_ack_dirty) != 0 || command_pending) {
+			atomic_set(&led_ack_pending, 1);
+		}
+
 		if (packet.type == LINK_TYPE_DFU_STATUS) {
 			k_spinlock_key_t key = k_spin_lock(&dfu_state_lock);
 			dfu_current_status = packet.data[0];
-			dfu_progress_percent = packet.data[1];
-			dfu_last_offset_div_4 = (uint16_t)packet.data[2] |
-				((uint16_t)packet.data[3] << 8);
+			dfu_status_session = packet.data[1];
+			dfu_status_token = packet.data[2];
+			dfu_status_detail = packet.data[3];
+			dfu_status_value = (uint32_t)packet.data[4] |
+				((uint32_t)packet.data[5] << 8) |
+				((uint32_t)packet.data[6] << 16) |
+				((uint32_t)packet.data[7] << 24);
+			if (dfu_ack_active &&
+			    packet.data[1] == dfu_pending_ack.data[1] &&
+			    packet.data[2] == dfu_pending_ack.sequence) {
+				dfu_ack_active = false;
+			}
 			k_spin_unlock(&dfu_state_lock, key);
-			ack_needed = true;
+			LOG_INF("dfu_status st=%u sess=%u tok=%u val=%u",
+				packet.data[0], packet.data[1], packet.data[2],
+				(uint32_t)packet.data[4] |
+					((uint32_t)packet.data[5] << 8) |
+					((uint32_t)packet.data[6] << 16) |
+					((uint32_t)packet.data[7] << 24));
+			atomic_set(&led_ack_pending, 1);
 			continue;
 		}
 
@@ -377,25 +590,23 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 				atomic_inc(&radio_bad_packets);
 				continue;
 			}
-			ack_needed = true;
 			battery_cache_update(&packet);
 			continue;
 		}
 
 		if (packet.type == LINK_TYPE_CONTROL) {
+			if (packet.data[0] == LINK_CONTROL_SESSION_RESET) {
+				receiver_reset_input_session();
+				continue;
+			}
 			if (packet.data[0] != LINK_CONTROL_POLL_ACK) {
 				atomic_inc(&radio_bad_packets);
 				continue;
 			}
-			ack_needed = true;
 			continue;
 		}
 
-		ack_needed = true;
-
-		if (packet.type == LINK_TYPE_KEYBOARD) {
-			atomic_set(&last_keyboard_packet_ms, k_uptime_get_32());
-		}
+		trace_record(TRACE_STAGE_ESB_RX, &packet, 0);
 
 		bool *previous_valid = packet.type == LINK_TYPE_KEYBOARD ?
 			&previous_keyboard_valid : &previous_consumer_valid;
@@ -405,47 +616,36 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			previous_keyboard : previous_consumer;
 		uint8_t *previous_sequence = packet.type == LINK_TYPE_KEYBOARD ?
 			&previous_keyboard_sequence : &previous_consumer_sequence;
-		bool const sequence_newer = !*previous_valid ||
-			sequence_is_newer(packet.sequence, *previous_sequence);
 		bool const same_sequence_retry = *previous_valid &&
 			packet.sequence == *previous_sequence && *previous_queue_failed;
+		bool const data_changed = !*previous_valid ||
+			memcmp(packet.data, previous_data, INPUT_DATA_SIZE) != 0;
 
 		/*
-		 * Keyboard packets are absolute states: if the data is identical to
-		 * the current keyboard state, it is a keepalive/duplicate, so drop it
-		 * and do NOT re-queue it to Windows.
+		 * If the payload is identical to the current active state and sequence
+		 * has not changed, drop it as an ESB duplicate retransmission.
 		 */
-		if (*previous_valid && !same_sequence_retry &&
-		    packet.type == LINK_TYPE_KEYBOARD &&
-		    memcmp(packet.data, previous_data, INPUT_DATA_SIZE) == 0) {
-			*previous_sequence = packet.sequence;
-			*previous_queue_failed = false;
+		if (!data_changed && packet.sequence == *previous_sequence && !same_sequence_retry) {
 			atomic_inc(&radio_duplicates);
+			trace_record(TRACE_STAGE_DUPLICATE_DROP, &packet, 0);
 			continue;
 		}
 
-		if (*previous_valid && !sequence_newer && !same_sequence_retry) {
-			atomic_inc(&radio_duplicates);
-			continue;
-		}
-
+		/*
+		 * Any valid state transition (key press, key release, combo, consumer action)
+		 * is immediately accepted and delivered to Windows.
+		 */
 		if (queue_hid_report(&packet)) {
+			trace_record(TRACE_STAGE_HID_QUEUED, &packet, 0);
 			*previous_valid = true;
 			*previous_sequence = packet.sequence;
 			*previous_queue_failed = false;
 			memcpy(previous_data, packet.data, INPUT_DATA_SIZE);
-			if (packet.type == LINK_TYPE_KEYBOARD) {
-				atomic_set(&keyboard_watchdog_released, 0);
-			}
 		} else {
 			*previous_valid = true;
 			*previous_sequence = packet.sequence;
 			*previous_queue_failed = true;
 		}
-	}
-
-	if (ack_needed) {
-		atomic_set(&led_ack_pending, 1);
 	}
 }
 
@@ -501,6 +701,7 @@ static int esb_initialize(void)
 
 static uint8_t hid_tx_buffer[1U + INPUT_DATA_SIZE];
 static uint8_t battery_feature_report[HID_FEATURE_REPORT_LEN];
+static uint8_t trace_feature_report[TRACE_FEATURE_REPORT_LEN];
 
 static void battery_feature_build(uint8_t report[HID_FEATURE_REPORT_LEN])
 {
@@ -523,6 +724,37 @@ static void battery_feature_build(uint8_t report[HID_FEATURE_REPORT_LEN])
 	k_spin_unlock(&battery_cache_lock, key);
 }
 
+static void trace_feature_build(uint8_t report[TRACE_FEATURE_REPORT_LEN])
+{
+	struct trace_entry entry = { 0 };
+	bool valid = false;
+	uint8_t remaining;
+	uint8_t overwrites;
+	bool frozen;
+	k_spinlock_key_t key = k_spin_lock(&trace_lock);
+
+	if (trace_count != 0U) {
+		entry = trace_queue[trace_tail];
+		trace_tail = (uint16_t)((trace_tail + 1U) % TRACE_QUEUE_DEPTH);
+		trace_count--;
+		valid = true;
+	}
+	remaining = (uint8_t)MIN(trace_count, UINT8_MAX);
+	overwrites = (uint8_t)MIN(trace_overwrites, UINT8_MAX);
+	frozen = trace_frozen;
+	k_spin_unlock(&trace_lock, key);
+
+	memset(report, 0, TRACE_FEATURE_REPORT_LEN);
+	report[0] = HID_REPORT_ID_TRACE;
+	report[1] = 1U; /* Trace protocol version. */
+	report[2] = (valid ? 0x01U : 0U) | (frozen ? 0x02U : 0U);
+	report[3] = remaining;
+	report[4] = overwrites;
+	if (valid) {
+		memcpy(&report[5], &entry, sizeof(entry));
+	}
+}
+
 static int hid_get_report(const struct device *dev,
 				  struct usb_setup_packet *setup,
 				  int32_t *len, uint8_t **data)
@@ -543,16 +775,23 @@ static int hid_get_report(const struct device *dev,
 		k_spinlock_key_t key = k_spin_lock(&dfu_state_lock);
 		dfu_feature_report[0] = HID_REPORT_ID_DFU;
 		dfu_feature_report[1] = dfu_current_status;
-		dfu_feature_report[2] = dfu_progress_percent;
-		dfu_feature_report[3] = (uint8_t)dfu_last_offset_div_4;
-		dfu_feature_report[4] = (uint8_t)(dfu_last_offset_div_4 >> 8);
-		dfu_feature_report[5] = 0;
-		dfu_feature_report[6] = 0;
-		dfu_feature_report[7] = 0;
-		dfu_feature_report[8] = 0;
+		dfu_feature_report[2] = dfu_status_session;
+		dfu_feature_report[3] = dfu_status_token;
+		dfu_feature_report[4] = dfu_status_detail;
+		dfu_feature_report[5] = (uint8_t)dfu_status_value;
+		dfu_feature_report[6] = (uint8_t)(dfu_status_value >> 8);
+		dfu_feature_report[7] = (uint8_t)(dfu_status_value >> 16);
+		dfu_feature_report[8] = (uint8_t)(dfu_status_value >> 24);
 		k_spin_unlock(&dfu_state_lock, key);
 		*data = dfu_feature_report;
 		*len = sizeof(dfu_feature_report);
+		return 0;
+	}
+
+	if (report_type == 3U && report_id == HID_REPORT_ID_TRACE) {
+		trace_feature_build(trace_feature_report);
+		*data = trace_feature_report;
+		*len = sizeof(trace_feature_report);
 		return 0;
 	}
 
@@ -584,18 +823,81 @@ static int hid_set_report(const struct device *dev,
 	if (report_type == 3U && report_id == HID_REPORT_ID_DFU &&
 	    *len >= 1 && *data != NULL) {
 		uint8_t const *const report = *data;
-		uint8_t const *const payload = (*len >= DFU_FEATURE_REPORT_LEN && report[0] == HID_REPORT_ID_DFU) ?
-			&report[1] : report;
+		uint8_t const *payload;
+		if (*len >= DFU_FEATURE_REPORT_LEN &&
+		    report[0] == HID_REPORT_ID_DFU) {
+			payload = &report[1];
+		} else if (*len >= DFU_FEATURE_PAYLOAD_LEN) {
+			payload = report;
+		} else {
+			return -EINVAL;
+		}
 		k_spinlock_key_t key = k_spin_lock(&dfu_state_lock);
+		if (dfu_ack_active && payload[0] != LINK_TYPE_DFU_START &&
+		    dfu_pending_ack.data[1] == payload[1]) {
+			bool const duplicate =
+				memcmp(dfu_pending_ack.data, payload,
+				       INPUT_DATA_SIZE) == 0;
+			if (duplicate) {
+				k_spin_unlock(&dfu_state_lock, key);
+				atomic_set(&led_ack_pending, 1);
+				(void)receiver_queue_led_ack();
+				return 0;
+			}
+			k_spin_unlock(&dfu_state_lock, key);
+			return -EBUSY;
+		}
 		dfu_pending_ack.magic = LINK_ACK_MAGIC;
 		dfu_pending_ack.version = LINK_VERSION;
 		dfu_pending_ack.type = LINK_ACK_TYPE_DFU;
-		dfu_pending_ack.sequence++;
+		dfu_pending_ack.sequence = ++dfu_command_sequence;
 		memcpy(dfu_pending_ack.data, payload, INPUT_DATA_SIZE);
+		LOG_INF("dfu_cmd %02x %02x %02x %02x %02x %02x %02x %02x tok=%u",
+			payload[0], payload[1], payload[2], payload[3],
+			payload[4], payload[5], payload[6], payload[7],
+			dfu_pending_ack.sequence);
 		dfu_ack_active = true;
 		dfu_current_status = DFU_STATUS_BUSY;
+		dfu_status_session = payload[1];
+		dfu_status_token = dfu_pending_ack.sequence;
+		dfu_status_detail = 0;
+		dfu_status_value = 0;
 		k_spin_unlock(&dfu_state_lock, key);
 		atomic_set(&led_ack_pending, 1);
+		(void)receiver_queue_led_ack();
+		return 0;
+	}
+
+	if (report_type == 3U && report_id == HID_REPORT_ID_BATTERY) {
+		/* Cached telemetry only. Battery polling must not create reverse ACK
+		 * traffic on the keyboard hot path. */
+		return 0;
+	}
+
+	if (report_type == 3U && report_id == HID_REPORT_ID_TRACE &&
+	    *len >= 1 && *data != NULL) {
+		uint8_t const *const report = *data;
+		uint8_t const command = (*len >= TRACE_FEATURE_REPORT_LEN &&
+			report[0] == HID_REPORT_ID_TRACE) ? report[1] : report[0];
+		k_spinlock_key_t key = k_spin_lock(&trace_lock);
+		switch (command) {
+		case TRACE_CMD_CLEAR:
+			trace_head = 0U;
+			trace_tail = 0U;
+			trace_count = 0U;
+			trace_overwrites = 0U;
+			break;
+		case TRACE_CMD_FREEZE:
+			trace_frozen = true;
+			break;
+		case TRACE_CMD_RESUME:
+			trace_frozen = false;
+			break;
+		default:
+			k_spin_unlock(&trace_lock, key);
+			return -EINVAL;
+		}
+		k_spin_unlock(&trace_lock, key);
 		return 0;
 	}
 
@@ -605,6 +907,7 @@ static int hid_set_report(const struct device *dev,
 static void hid_int_in_ready(const struct device *dev)
 {
 	ARG_UNUSED(dev);
+	trace_record_inflight_complete();
 	k_sem_give(&hid_in_idle);
 }
 
@@ -673,7 +976,8 @@ static bool usb_hid_ready(void)
 	       atomic_get(&usb_suspended) == 0;
 }
 
-static int send_hid_report(const uint8_t *report, size_t report_size)
+static int send_hid_report(const uint8_t *report, size_t report_size,
+			   const struct link_input_packet *trace_packet)
 {
 	if (!usb_hid_ready()) {
 		return -ENOTCONN;
@@ -685,37 +989,40 @@ static int send_hid_report(const uint8_t *report, size_t report_size)
 		return -EBUSY;
 	}
 
+	trace_inflight_prepare(trace_packet);
 	memcpy(hid_tx_buffer, report, report_size);
 	int const err = hid_int_ep_write(hid_device, hid_tx_buffer,
 					 report_size, NULL);
 	if (err != 0) {
+		trace_inflight_cancel();
 		k_sem_give(&hid_in_idle);
 		atomic_inc(&hid_write_errors);
 		return err;
 	}
 
+	trace_record(TRACE_STAGE_HID_SUBMIT_OK, trace_packet, 0);
 	atomic_inc(&hid_reports_sent);
 	return 0;
 }
 
-static int send_keyboard_report(const uint8_t data[INPUT_DATA_SIZE])
+static int send_keyboard_report(const struct link_input_packet *packet)
 {
 	uint8_t report[1U + INPUT_DATA_SIZE];
 
 	report[0] = HID_REPORT_ID_KEYBOARD;
-	memcpy(&report[1], data, INPUT_DATA_SIZE);
-	return send_hid_report(report, sizeof(report));
+	memcpy(&report[1], packet->data, INPUT_DATA_SIZE);
+	return send_hid_report(report, sizeof(report), packet);
 }
 
-static int send_consumer_report(const uint8_t data[INPUT_DATA_SIZE])
+static int send_consumer_report(const struct link_input_packet *packet)
 {
 	const uint8_t report[] = {
 		HID_REPORT_ID_CONSUMER,
-		data[0],
-		data[1],
+		packet->data[0],
+		packet->data[1],
 	};
 
-	return send_hid_report(report, sizeof(report));
+	return send_hid_report(report, sizeof(report), packet);
 }
 
 static int usb_hid_initialize(void)
@@ -770,22 +1077,13 @@ K_THREAD_DEFINE(status_thread_id, 1024, status_thread,
 		NULL, NULL, NULL, 7, 0, 0);
 #endif
 
-static bool keyboard_data_is_released(const uint8_t data[INPUT_DATA_SIZE])
-{
-	static const uint8_t released[INPUT_DATA_SIZE] = { 0 };
-
-	return memcmp(data, released, sizeof(released)) == 0;
-}
-
 int main(void)
 {
-	uint8_t current_keyboard[INPUT_DATA_SIZE] = { 0 };
 	struct link_input_packet hid_pending = { 0 };
 	bool hid_pending_valid = false;
-	uint32_t next_keyboard_keepalive_ms = 0;
+	bool hid_pending_failure_logged = false;
 	int err;
 
-	LOG_INF("Starting ESB-to-USB keyboard and consumer-control receiver");
 	windows_led_epoch = (uint8_t)k_cycle_get_32();
 
 	/*
@@ -811,8 +1109,6 @@ int main(void)
 
 	for (;;) {
 		struct link_input_packet queued;
-		uint32_t const now = k_uptime_get_32();
-
 		receiver_ack_task();
 
 		if (!usb_hid_ready()) {
@@ -822,46 +1118,36 @@ int main(void)
 			 */
 			while (k_msgq_get(&hid_report_queue, &queued,
 					  K_NO_WAIT) == 0) {
-				if (queued.type == LINK_TYPE_KEYBOARD) {
-					memcpy(current_keyboard, queued.data,
-					       sizeof(current_keyboard));
-				}
+				trace_record(TRACE_STAGE_USB_NOT_READY_DROP, &queued,
+					     -ENOTCONN);
 			}
 			hid_pending_valid = false;
+			hid_pending_failure_logged = false;
 			k_msleep(1);
 			continue;
-		}
-
-		if (!keyboard_data_is_released(current_keyboard) &&
-		    (uint32_t)(now -
-		    (uint32_t)atomic_get(&last_keyboard_packet_ms)) >=
-		    KEYBOARD_LINK_TIMEOUT_MS && !hid_pending_valid) {
-			memset(current_keyboard, 0, sizeof(current_keyboard));
-			atomic_set(&keyboard_watchdog_released, 1);
-			hid_pending.type = LINK_TYPE_KEYBOARD;
-			hid_pending.sequence = 0;
-			memcpy(hid_pending.data, current_keyboard,
-			       sizeof(hid_pending.data));
-			hid_pending_valid = true;
 		}
 
 		if (!hid_pending_valid &&
 		    k_msgq_get(&hid_report_queue, &queued, K_NO_WAIT) == 0) {
 			hid_pending = queued;
 			hid_pending_valid = true;
-			if (queued.type == LINK_TYPE_KEYBOARD) {
-				memcpy(current_keyboard, queued.data,
-				       sizeof(current_keyboard));
-			}
+			hid_pending_failure_logged = false;
 		}
 
 		if (hid_pending_valid) {
 			int const send_result = hid_pending.type == LINK_TYPE_KEYBOARD ?
-				send_keyboard_report(hid_pending.data) :
-				send_consumer_report(hid_pending.data);
+				send_keyboard_report(&hid_pending) :
+				send_consumer_report(&hid_pending);
 
 			if (send_result == 0) {
 				hid_pending_valid = false;
+				hid_pending_failure_logged = false;
+			} else if (!hid_pending_failure_logged) {
+				trace_record(send_result == -EBUSY ?
+					TRACE_STAGE_HID_SUBMIT_BUSY :
+					TRACE_STAGE_HID_SUBMIT_ERROR,
+					&hid_pending, send_result);
+				hid_pending_failure_logged = true;
 			}
 		}
 
