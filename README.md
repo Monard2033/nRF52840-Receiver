@@ -4,13 +4,15 @@ This firmware runs on the **nRF52840 USB Dongle** (Holyiot nRF52840 Dongle / Nor
 
 ---
 
-## Current Release Baseline (v1.0-stable)
+## Ecosystem & Repositories (v1.0 Stable)
 
-- **Branch**: `release/v1.0-stable` across all three project repositories:
-  - [RP2040 Keyboard Controller](https://github.com/Monard2033/RaspberryPicoUSBHost)
-  - [nRF52840 Transmitter](https://github.com/Monard2033/nRF52840-Transmitter)
-  - [nRF52840 Receiver](https://github.com/Monard2033/nRF52840-Receiver)
-- **Primary Binary Artifact**: [`firmware/receiver.hex`](firmware/receiver.hex)
+This firmware is part of the 3-tier custom wireless keyboard project:
+- 🧠 **[RP2040 Keyboard Controller](https://github.com/Monard2033/RaspberryPicoUSBHost)**: USB Host, Battery ADC & 8 MHz SPI Master.
+- 📻 **[nRF52840 Transmitter](https://github.com/Monard2033/nRF52840-Transmitter)**: Pro Micro SPI Slave & 2.4 GHz ESB PTX (+8 dBm).
+- 📡 **[nRF52840 Receiver](https://github.com/Monard2033/nRF52840-Receiver)** (this repository): USB Dongle 2.4 GHz ESB PRX & 1000 Hz USB HID Bridge.
+
+### Primary Release Artifacts
+- **Firmware Binary**: [`firmware/receiver.hex`](firmware/receiver.hex)
 - **SHA-256 Checksum**: `16DF6B5D9A7FEDB02D9F04BA0057EA2F9F36F43DF78791B8FB3F22599DBE16F4`
 
 ---
