@@ -273,6 +273,7 @@ static uint8_t battery_flags;
 static uint32_t battery_last_update_ms;
 static bool battery_cache_valid;
 
+K_MSGQ_DEFINE(dfu_ack_queue, sizeof(struct link_ack_frame), 64, 4);
 static struct k_spinlock dfu_state_lock;
 static struct link_ack_frame dfu_pending_ack;
 static bool dfu_ack_active;
@@ -416,56 +417,73 @@ static void receiver_set_led_state(uint8_t led_state)
 	}
 }
 
-static bool receiver_queue_led_ack(void)
+static bool receiver_queue_dfu_ack(void)
 {
-	struct link_ack_frame ack = {
-		.magic = LINK_ACK_MAGIC,
-		.version = LINK_VERSION,
-		.type = LINK_ACK_TYPE_LOCK_STATE,
-	};
-	struct esb_payload payload = { 0 };
+	k_spinlock_key_t key = k_spin_lock(&dfu_state_lock);
+	bool queued = false;
 
-	k_spinlock_key_t dfu_key = k_spin_lock(&dfu_state_lock);
-	if (dfu_ack_active) {
-		ack = dfu_pending_ack;
-		k_spin_unlock(&dfu_state_lock, dfu_key);
-	} else {
-		k_spin_unlock(&dfu_state_lock, dfu_key);
-		atomic_set(&led_ack_dirty, 0);
-		k_spinlock_key_t key = k_spin_lock(&led_state_lock);
-		ack.sequence = windows_led_sequence;
-		ack.data[0] = windows_led_state;
-		ack.data[1] = windows_led_valid ? 0x01U : 0x00U;
-		ack.data[2] = windows_led_epoch;
-		k_spin_unlock(&led_state_lock, key);
+	for (;;) {
+		if (!dfu_ack_active) {
+			struct link_ack_frame next;
+			if (k_msgq_get(&dfu_ack_queue, &next, K_NO_WAIT) != 0) {
+				break;
+			}
+			dfu_pending_ack = next;
+			dfu_ack_active = true;
+		}
+
+		struct esb_payload payload = { 0 };
+		payload.length = sizeof(dfu_pending_ack);
+		payload.pipe = 0;
+		payload.noack = false;
+		memcpy(payload.data, &dfu_pending_ack, sizeof(dfu_pending_ack));
+
+		int err = esb_write_payload(&payload);
+		if (err != 0) {
+			break;
+		}
+
+		dfu_ack_active = false;
+		queued = true;
 	}
 
-	payload.length = sizeof(ack);
-	payload.pipe = 0;
-	payload.noack = false;
-	memcpy(payload.data, &ack, sizeof(ack));
-	bool const queued = esb_write_payload(&payload) == 0;
-	if (!queued) {
-		/* Preserve both the pending DFU command and the retry request. */
-		atomic_set(&led_ack_pending, 1);
-	}
-	/* OTA diagnostic: prove whether reverse ACK payloads are accepted by
-	 * the ESB stack and whether a DFU command is being held. */
-	static int64_t diag_last_ack_log;
-	int64_t const diag_now = k_uptime_get();
-	if (queued || (diag_now - diag_last_ack_log) > 1000) {
-		diag_last_ack_log = diag_now;
-		LOG_INF("ackq dfu_held=%u queued=%u led=%02x",
-			ack.type == LINK_ACK_TYPE_DFU ? 1u : 0u, queued ? 1u : 0u,
-			ack.data[0]);
-	}
+	k_spin_unlock(&dfu_state_lock, key);
 	return queued;
 }
 
 static void receiver_ack_task(void)
 {
+	(void)receiver_queue_dfu_ack();
+
 	if (atomic_cas(&led_ack_pending, 1, 0)) {
-		(void)receiver_queue_led_ack();
+		k_spinlock_key_t key = k_spin_lock(&dfu_state_lock);
+		bool const dfu_idle = !dfu_ack_active &&
+			(k_msgq_num_used_get(&dfu_ack_queue) == 0);
+		k_spin_unlock(&dfu_state_lock, key);
+
+		if (dfu_idle) {
+			struct link_ack_frame ack = {
+				.magic = LINK_ACK_MAGIC,
+				.version = LINK_VERSION,
+				.type = 0x00U,
+			};
+			k_spinlock_key_t led_key = k_spin_lock(&led_state_lock);
+			if (windows_led_valid) {
+				ack.type = LINK_ACK_TYPE_LOCK_STATE;
+				ack.sequence = windows_led_sequence;
+				ack.data[0] = windows_led_state;
+				ack.data[1] = 0x01U;
+				ack.data[2] = windows_led_epoch;
+			}
+			k_spin_unlock(&led_state_lock, led_key);
+
+			struct esb_payload payload = { 0 };
+			payload.length = sizeof(ack);
+			payload.pipe = 0;
+			payload.noack = false;
+			memcpy(payload.data, &ack, sizeof(ack));
+			(void)esb_write_payload(&payload);
+		}
 	}
 }
 
@@ -516,6 +534,11 @@ static void receiver_reset_input_session(void)
 
 static void receiver_esb_event_handler(const struct esb_evt *event)
 {
+	if (event->evt_id == ESB_EVENT_TX_SUCCESS) {
+		(void)receiver_queue_dfu_ack();
+		return;
+	}
+
 	if (event->evt_id != ESB_EVENT_RX_RECEIVED) {
 		return;
 	}
@@ -538,17 +561,6 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			continue;
 		}
 
-		/* DIAGNOSTIC A/B: skip the per-RX-event re-queue of a pending DFU
-		 * command (Gemini-era behavior) while investigating the reverse
-		 * ACK path. */
-		k_spinlock_key_t pending_key = k_spin_lock(&dfu_state_lock);
-		bool const command_pending = dfu_ack_active;
-		k_spin_unlock(&dfu_state_lock, pending_key);
-
-		if (atomic_get(&led_ack_dirty) != 0 || command_pending) {
-			atomic_set(&led_ack_pending, 1);
-		}
-
 		if (packet.type == LINK_TYPE_DFU_STATUS) {
 			k_spinlock_key_t key = k_spin_lock(&dfu_state_lock);
 			dfu_current_status = packet.data[0];
@@ -559,19 +571,7 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 				((uint32_t)packet.data[5] << 8) |
 				((uint32_t)packet.data[6] << 16) |
 				((uint32_t)packet.data[7] << 24);
-			if (dfu_ack_active &&
-			    packet.data[1] == dfu_pending_ack.data[1] &&
-			    packet.data[2] == dfu_pending_ack.sequence) {
-				dfu_ack_active = false;
-			}
 			k_spin_unlock(&dfu_state_lock, key);
-			LOG_INF("dfu_status st=%u sess=%u tok=%u val=%u",
-				packet.data[0], packet.data[1], packet.data[2],
-				(uint32_t)packet.data[4] |
-					((uint32_t)packet.data[5] << 8) |
-					((uint32_t)packet.data[6] << 16) |
-					((uint32_t)packet.data[7] << 24));
-			atomic_set(&led_ack_pending, 1);
 			continue;
 		}
 
@@ -637,6 +637,8 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 			*previous_queue_failed = true;
 		}
 	}
+
+	(void)receiver_queue_dfu_ack();
 }
 
 static int esb_initialize(void)
@@ -822,39 +824,38 @@ static int hid_set_report(const struct device *dev,
 		} else {
 			return -EINVAL;
 		}
+
+		struct link_ack_frame ack = {
+			.magic = LINK_ACK_MAGIC,
+			.version = LINK_VERSION,
+			.type = LINK_ACK_TYPE_DFU,
+		};
+
 		k_spinlock_key_t key = k_spin_lock(&dfu_state_lock);
-		if (dfu_ack_active && payload[0] != LINK_TYPE_DFU_START &&
-		    dfu_pending_ack.data[1] == payload[1]) {
-			bool const duplicate =
-				memcmp(dfu_pending_ack.data, payload,
-				       INPUT_DATA_SIZE) == 0;
-			if (duplicate) {
-				k_spin_unlock(&dfu_state_lock, key);
-				atomic_set(&led_ack_pending, 1);
-				(void)receiver_queue_led_ack();
-				return 0;
-			}
+		if (payload[0] == LINK_TYPE_DFU_START) {
+			k_msgq_purge(&dfu_ack_queue);
+			dfu_ack_active = false;
+			dfu_command_sequence = 0U;
+		}
+
+		ack.sequence = ++dfu_command_sequence;
+		memcpy(ack.data, payload, INPUT_DATA_SIZE);
+
+		if (k_msgq_put(&dfu_ack_queue, &ack, K_NO_WAIT) != 0) {
 			k_spin_unlock(&dfu_state_lock, key);
 			return -EBUSY;
 		}
-		dfu_pending_ack.magic = LINK_ACK_MAGIC;
-		dfu_pending_ack.version = LINK_VERSION;
-		dfu_pending_ack.type = LINK_ACK_TYPE_DFU;
-		dfu_pending_ack.sequence = ++dfu_command_sequence;
-		memcpy(dfu_pending_ack.data, payload, INPUT_DATA_SIZE);
-		LOG_INF("dfu_cmd %02x %02x %02x %02x %02x %02x %02x %02x tok=%u",
-			payload[0], payload[1], payload[2], payload[3],
-			payload[4], payload[5], payload[6], payload[7],
-			dfu_pending_ack.sequence);
-		dfu_ack_active = true;
-		dfu_current_status = DFU_STATUS_BUSY;
-		dfu_status_session = payload[1];
-		dfu_status_token = dfu_pending_ack.sequence;
-		dfu_status_detail = 0;
-		dfu_status_value = 0;
+
+		if (payload[0] == LINK_TYPE_DFU_START) {
+			dfu_current_status = DFU_STATUS_BUSY;
+			dfu_status_session = payload[1];
+			dfu_status_token = ack.sequence;
+			dfu_status_detail = 0;
+			dfu_status_value = 0;
+		}
 		k_spin_unlock(&dfu_state_lock, key);
-		atomic_set(&led_ack_pending, 1);
-		(void)receiver_queue_led_ack();
+
+		(void)receiver_queue_dfu_ack();
 		return 0;
 	}
 
