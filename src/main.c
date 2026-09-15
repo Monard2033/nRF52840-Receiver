@@ -40,8 +40,43 @@ LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 #define HID_REPORT_ID_BATTERY  0x03U
 #define HID_REPORT_ID_DFU      0x04U
 #define HID_REPORT_ID_TRACE    0x05U
-#define HID_FEATURE_PAYLOAD_LEN 8U
+#define HID_FEATURE_PAYLOAD_LEN 10U
 #define HID_FEATURE_REPORT_LEN  (1U + HID_FEATURE_PAYLOAD_LEN)
+
+/* Battery flags bits (payload[5]). */
+#define BATTERY_FLAG_VALID        0x01U
+#define BATTERY_FLAG_MATERIAL     0x02U
+#define BATTERY_FLAG_ETA_VALID    0x04U
+#define BATTERY_FLAG_MASK         0x07U
+#define BATTERY_ETA_UNKNOWN       0xFFFFU
+
+/*
+ * Battery discharge ETA estimator.
+ *
+ * The Receiver is the only node that observes the battery continuously, so it
+ * keeps the discharge history itself and hands the tray a ready-made number.
+ * A tray restart therefore shows the countdown immediately instead of waiting
+ * for a fresh warm-up window.
+ *
+ * Voltage is a state, not a flow: a load step (keypress, radio burst, LED)
+ * sags the cell and recovers, which a raw first/last difference would read as a
+ * huge fake discharge rate. The slope is therefore measured between the median
+ * of a block of the oldest samples and the median of a block of the newest
+ * samples, over the time between the two block centres.
+ */
+#define BATT_ETA_HISTORY_LEN      1024U   /* ~17 min at 1 Hz */
+#define BATT_ETA_MEDIAN_LEN       5U      /* 5 s median filter on raw mV */
+#define BATT_ETA_BLOCK_LEN        4U      /* 4 s median per window endpoint */
+#define BATT_ETA_RATE_SMOOTH_LEN  9U
+#define BATT_ETA_MAX_WINDOW_MS    (60UL * 60UL * 1000UL)
+#define BATT_ETA_MIN_WINDOW_MS    (5UL * 60UL * 1000UL)
+#define BATT_ETA_GAP_RESET_MS     (6UL * 60UL * 60UL * 1000UL)
+#define BATT_ETA_RISE_RESET_MV    25
+#define BATT_ETA_MIN_DROP_MV      5U
+#define BATT_ETA_MIN_MV           3050U   /* mirrors the RP2040 BATT_MIN_MV */
+#define BATT_ETA_MAX_MV           4190U   /* mirrors the RP2040 BATT_MAX_MV */
+#define BATT_ETA_MV_PER_PCT_X100  1140L   /* (4190-3050)/100 * 100 */
+#define BATT_ETA_SAMPLE_MS        1000U
 #define DFU_FEATURE_PAYLOAD_LEN 8U
 #define DFU_FEATURE_REPORT_LEN  (1U + DFU_FEATURE_PAYLOAD_LEN)
 #define TRACE_FEATURE_PAYLOAD_LEN 20U
@@ -57,6 +92,8 @@ LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 #define LINK_TYPE_DFU_DATA      0x11U
 #define LINK_TYPE_DFU_FINISH    0x12U
 #define LINK_TYPE_DFU_STATUS    0x13U
+#define LINK_TYPE_DFU_FIRST     0x10U
+#define LINK_TYPE_DFU_LAST      0x1FU
 #define LINK_ACK_TYPE_DFU       0x02U
 
 #define DFU_STATUS_IDLE         0x00U
@@ -272,6 +309,245 @@ static uint8_t battery_sequence;
 static uint8_t battery_flags;
 static uint32_t battery_last_update_ms;
 static bool battery_cache_valid;
+static uint16_t battery_eta_minutes;
+static bool battery_eta_valid;
+
+/* Discharge ETA estimator state (only touched by the ETA thread). */
+struct batt_eta_sample {
+	uint32_t time_ms;
+	uint16_t millivolts;
+};
+
+static struct batt_eta_sample batt_eta_history[BATT_ETA_HISTORY_LEN];
+static uint16_t batt_eta_count;
+static uint16_t batt_eta_head;
+static uint16_t batt_eta_med[BATT_ETA_MEDIAN_LEN];
+static uint16_t batt_eta_med_count;
+static uint16_t batt_eta_med_head;
+static int32_t batt_eta_rate[BATT_ETA_RATE_SMOOTH_LEN];
+static uint16_t batt_eta_rate_count;
+static uint16_t batt_eta_rate_head;
+static uint32_t batt_eta_last_ms;
+static bool batt_eta_has_last;
+
+static uint16_t batt_eta_median_u16(uint16_t *values, uint16_t n)
+{
+	for (uint16_t i = 1U; i < n; ++i) {
+		uint16_t const key = values[i];
+		uint16_t j = i;
+
+		while (j > 0U && values[j - 1U] > key) {
+			values[j] = values[j - 1U];
+			--j;
+		}
+		values[j] = key;
+	}
+	return values[n / 2U];
+}
+
+static uint16_t batt_eta_median_filter_value(void)
+{
+	uint16_t scratch[BATT_ETA_MEDIAN_LEN];
+
+	for (uint16_t i = 0U; i < batt_eta_med_count; ++i) {
+		scratch[i] = batt_eta_med[i];
+	}
+	return batt_eta_median_u16(scratch, batt_eta_med_count);
+}
+
+static uint16_t batt_eta_block_median(uint16_t from, uint16_t block_len)
+{
+	uint16_t scratch[BATT_ETA_BLOCK_LEN];
+
+	for (uint16_t i = 0U; i < block_len; ++i) {
+		scratch[i] = batt_eta_history[(from + i) % BATT_ETA_HISTORY_LEN]
+				     .millivolts;
+	}
+	return batt_eta_median_u16(scratch, block_len);
+}
+
+static void batt_eta_reset(void)
+{
+	batt_eta_count = 0U;
+	batt_eta_head = 0U;
+	batt_eta_med_count = 0U;
+	batt_eta_med_head = 0U;
+	batt_eta_rate_count = 0U;
+	batt_eta_rate_head = 0U;
+	batt_eta_has_last = false;
+}
+
+static int32_t batt_eta_median_rate(void)
+{
+	int32_t sorted[BATT_ETA_RATE_SMOOTH_LEN];
+
+	if (batt_eta_rate_count == 0U) {
+		return 0;
+	}
+	for (uint16_t i = 0U; i < batt_eta_rate_count; ++i) {
+		sorted[i] = batt_eta_rate[i];
+	}
+	for (uint16_t i = 1U; i < batt_eta_rate_count; ++i) {
+		int32_t const key = sorted[i];
+		uint16_t j = i;
+
+		while (j > 0U && sorted[j - 1U] > key) {
+			sorted[j] = sorted[j - 1U];
+			--j;
+		}
+		sorted[j] = key;
+	}
+	return sorted[batt_eta_rate_count / 2U];
+}
+
+/*
+ * Fit the discharge slope over the newest window. Returns true and fills
+ * rate_x100 (mV per minute, scaled by 100) when a usable slope exists.
+ */
+static bool batt_eta_fit_rate(int32_t *rate_x100)
+{
+	if (batt_eta_count < (BATT_ETA_BLOCK_LEN * 2U)) {
+		return false;
+	}
+
+	uint32_t const newest_time =
+		batt_eta_history[(batt_eta_head + BATT_ETA_HISTORY_LEN - 1U) %
+				 BATT_ETA_HISTORY_LEN].time_ms;
+
+	/* Index (from the oldest kept sample) where the window starts. */
+	uint16_t index = 0U;
+
+	while (index + 1U < batt_eta_count) {
+		uint16_t const slot =
+			(batt_eta_head + BATT_ETA_HISTORY_LEN - batt_eta_count + index) %
+			BATT_ETA_HISTORY_LEN;
+
+		if ((newest_time - batt_eta_history[slot].time_ms) <=
+		    BATT_ETA_MAX_WINDOW_MS) {
+			break;
+		}
+		++index;
+	}
+
+	uint16_t const span = batt_eta_count - index;
+	uint16_t block_len = span / 2U;
+
+	if (block_len > BATT_ETA_BLOCK_LEN) {
+		block_len = BATT_ETA_BLOCK_LEN;
+	}
+	if (block_len == 0U) {
+		return false;
+	}
+
+	uint16_t const oldest_block = index;
+	uint16_t const newest_block = batt_eta_count - block_len;
+
+	int32_t const oldest_mv = (int32_t)batt_eta_block_median(oldest_block,
+							block_len);
+	int32_t const newest_mv = (int32_t)batt_eta_block_median(newest_block,
+							block_len);
+
+	uint16_t const oldest_centre =
+		(batt_eta_head + BATT_ETA_HISTORY_LEN - batt_eta_count +
+		 oldest_block + (block_len / 2U)) % BATT_ETA_HISTORY_LEN;
+	uint16_t const newest_centre =
+		(batt_eta_head + BATT_ETA_HISTORY_LEN - batt_eta_count +
+		 newest_block + (block_len / 2U)) % BATT_ETA_HISTORY_LEN;
+
+	uint32_t const t_old = batt_eta_history[oldest_centre].time_ms;
+	uint32_t const t_new = batt_eta_history[newest_centre].time_ms;
+
+	if (t_new <= t_old) {
+		return false;
+	}
+
+	uint32_t const elapsed_ms = t_new - t_old;
+
+	if (elapsed_ms < BATT_ETA_MIN_WINDOW_MS) {
+		return false;
+	}
+
+	int32_t const drop_mv = oldest_mv - newest_mv;
+
+	if (drop_mv < (int32_t)BATT_ETA_MIN_DROP_MV) {
+		return false;
+	}
+
+	*rate_x100 = (int32_t)(((int64_t)drop_mv * 6000000LL) /
+			       (int64_t)elapsed_ms);
+	return *rate_x100 > 0;
+}
+
+static void batt_eta_update(uint32_t now_ms, uint16_t millivolts)
+{
+	if (batt_eta_has_last &&
+	    (now_ms - batt_eta_last_ms) > BATT_ETA_GAP_RESET_MS) {
+		batt_eta_reset();
+	}
+
+	/*
+	 * A rise this large means a charge cycle happened while we were not
+	 * looking, so the stored history is no longer one continuous discharge.
+	 */
+	if (batt_eta_med_count > 0U &&
+	    ((int32_t)millivolts -
+	     (int32_t)batt_eta_median_filter_value()) > BATT_ETA_RISE_RESET_MV) {
+		batt_eta_reset();
+	}
+
+	batt_eta_history[batt_eta_head].time_ms = now_ms;
+	batt_eta_history[batt_eta_head].millivolts = millivolts;
+	batt_eta_head = (uint16_t)((batt_eta_head + 1U) % BATT_ETA_HISTORY_LEN);
+	if (batt_eta_count < BATT_ETA_HISTORY_LEN) {
+		batt_eta_count++;
+	}
+	batt_eta_last_ms = now_ms;
+	batt_eta_has_last = true;
+
+	batt_eta_med[batt_eta_med_head] = millivolts;
+	batt_eta_med_head =
+		(uint16_t)((batt_eta_med_head + 1U) % BATT_ETA_MEDIAN_LEN);
+	if (batt_eta_med_count < BATT_ETA_MEDIAN_LEN) {
+		batt_eta_med_count++;
+	}
+
+	int32_t rate_x100 = 0;
+	bool valid = false;
+	uint16_t minutes = BATTERY_ETA_UNKNOWN;
+
+	if (batt_eta_fit_rate(&rate_x100)) {
+		batt_eta_rate[batt_eta_rate_head] = rate_x100;
+		batt_eta_rate_head =
+			(uint16_t)((batt_eta_rate_head + 1U) %
+				   BATT_ETA_RATE_SMOOTH_LEN);
+		if (batt_eta_rate_count < BATT_ETA_RATE_SMOOTH_LEN) {
+			batt_eta_rate_count++;
+		}
+
+		int32_t const smoothed = batt_eta_median_rate();
+
+		if (smoothed > 0) {
+			int32_t const remaining_mv =
+				(int32_t)batt_eta_median_filter_value() -
+				(int32_t)BATT_ETA_MIN_MV;
+
+			if (remaining_mv > 0) {
+				int64_t const mins =
+					((int64_t)remaining_mv * 100LL) /
+					(int64_t)smoothed;
+
+				minutes = (uint16_t)MIN(mins,
+							(int64_t)BATTERY_ETA_UNKNOWN - 1);
+				valid = true;
+			}
+		}
+	}
+
+	k_spinlock_key_t key = k_spin_lock(&battery_cache_lock);
+	battery_eta_minutes = minutes;
+	battery_eta_valid = valid;
+	k_spin_unlock(&battery_cache_lock, key);
+}
 
 K_MSGQ_DEFINE(dfu_ack_queue, sizeof(struct link_ack_frame), 64, 4);
 static struct k_spinlock dfu_state_lock;
@@ -368,6 +644,13 @@ static bool queue_hid_report(const struct link_input_packet *packet)
 		return k_msgq_put(&hid_report_queue, packet, K_NO_WAIT) == 0;
 	}
 	return false;
+}
+
+/* DFU OTA command range (0x10..0x1F). DFU frames are strictly ordered,
+ * opaque protocol data; every suppression path must bypass them. */
+static bool frame_is_dfu_command(uint8_t type)
+{
+	return type >= LINK_TYPE_DFU_FIRST && type <= LINK_TYPE_DFU_LAST;
 }
 
 static bool battery_packet_is_valid(const struct link_input_packet *packet)
@@ -614,8 +897,10 @@ static void receiver_esb_event_handler(const struct esb_evt *event)
 		/*
 		 * If the payload is identical to the current active state and sequence
 		 * has not changed, drop it as an ESB duplicate retransmission.
-		 */
-		if (!data_changed && packet.sequence == *previous_sequence && !same_sequence_retry) {
+		 * DFU frames (0x10..0x1F) are never suppressed: the RP2040 DFU handler
+		 * owns all duplicate/replay policy for the OTA stream. */
+		if (!frame_is_dfu_command(packet.type) &&
+		    !data_changed && packet.sequence == *previous_sequence && !same_sequence_retry) {
 			atomic_inc(&radio_duplicates);
 			trace_record(TRACE_STAGE_DUPLICATE_DROP, &packet, 0);
 			continue;
@@ -703,6 +988,9 @@ static void battery_feature_build(uint8_t report[HID_FEATURE_REPORT_LEN])
 		(k_uptime_get_32() - battery_last_update_ms) : UINT32_MAX;
 	uint32_t const age_seconds = age_ms == UINT32_MAX ? 0xFFFFU :
 		MIN(age_ms / 1000U, 0xFFFFU);
+	uint16_t const eta_minutes = battery_eta_valid ? battery_eta_minutes :
+		BATTERY_ETA_UNKNOWN;
+	uint8_t const eta_bit = battery_eta_valid ? BATTERY_FLAG_ETA_VALID : 0U;
 
 	report[0] = HID_REPORT_ID_BATTERY;
 	payload[0] = battery_percentage;
@@ -710,9 +998,11 @@ static void battery_feature_build(uint8_t report[HID_FEATURE_REPORT_LEN])
 	payload[2] = (uint8_t)battery_millivolts;
 	payload[3] = (uint8_t)(battery_millivolts >> 8);
 	payload[4] = battery_sequence;
-	payload[5] = battery_cache_valid ? battery_flags : 0U;
+	payload[5] = (battery_cache_valid ? battery_flags : 0U) | eta_bit;
 	payload[6] = (uint8_t)age_seconds;
 	payload[7] = (uint8_t)(age_seconds >> 8);
+	payload[8] = (uint8_t)eta_minutes;
+	payload[9] = (uint8_t)(eta_minutes >> 8);
 	k_spin_unlock(&battery_cache_lock, key);
 }
 
@@ -1036,6 +1326,67 @@ static int usb_hid_initialize(void)
 	return usb_enable(usb_status_callback);
 }
 
+/*
+ * Battery ETA sampling.
+ *
+ * NOTE: this is deliberately NOT a separate low-priority thread. main() runs
+ * at priority 0 and never blocks (it only calls k_yield(), which in Zephyr
+ * yields only to threads of the SAME priority), so any lower-priority thread
+ * would be starved forever. The work is therefore rate-limited from the main
+ * loop instead: it costs a few microseconds once per second.
+ */
+static void battery_eta_task(void)
+{
+	static uint32_t last_sample_ms;
+	static uint8_t last_state = 0xFFU;
+	static bool have_state;
+
+	uint32_t const now = k_uptime_get_32();
+
+	if (have_state && (now - last_sample_ms) < BATT_ETA_SAMPLE_MS) {
+		return;
+	}
+	last_sample_ms = now;
+
+	uint8_t pct;
+	uint8_t state;
+	uint16_t millivolts;
+	bool valid;
+	k_spinlock_key_t key = k_spin_lock(&battery_cache_lock);
+
+	valid = battery_cache_valid;
+	pct = battery_percentage;
+	state = battery_state;
+	millivolts = battery_millivolts;
+	k_spin_unlock(&battery_cache_lock, key);
+
+	ARG_UNUSED(pct);
+
+	if (valid && (state == 1U || state == 3U)) {
+		/* Charging or full: a charge cycle voids the history. */
+		if (!have_state || last_state != state) {
+			batt_eta_reset();
+			key = k_spin_lock(&battery_cache_lock);
+			battery_eta_valid = false;
+			battery_eta_minutes = BATTERY_ETA_UNKNOWN;
+			k_spin_unlock(&battery_cache_lock, key);
+		}
+		have_state = true;
+		last_state = state;
+	} else if (valid && (state == 0U || state == 2U)) {
+		if (have_state && (last_state == 1U || last_state == 3U)) {
+			batt_eta_reset();
+		}
+		have_state = true;
+		last_state = state;
+		batt_eta_update(now, millivolts);
+	} else {
+		/* Unreported state: keep the history, do not feed it. */
+		have_state = false;
+		last_state = 0xFFU;
+	}
+}
+
 #if CONFIG_LOG
 static void status_thread(void)
 {
@@ -1101,6 +1452,7 @@ int main(void)
 	for (;;) {
 		struct link_input_packet queued;
 		receiver_ack_task();
+		battery_eta_task();
 
 		if (!usb_hid_ready()) {
 			/*
