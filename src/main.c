@@ -77,6 +77,7 @@ LOG_MODULE_REGISTER(receiver, LOG_LEVEL_INF);
 #define BATT_ETA_MAX_MV           4190U   /* mirrors the RP2040 BATT_MAX_MV */
 #define BATT_ETA_MV_PER_PCT_X100  1140L   /* (4190-3050)/100 * 100 */
 #define BATT_ETA_SAMPLE_MS        1000U
+#define BATT_ETA_FRESH_TIMEOUT_MS 60000U  /* Max telemetry age before treating as asleep (packets sent every 20s) */
 #define DFU_FEATURE_PAYLOAD_LEN 8U
 #define DFU_FEATURE_REPORT_LEN  (1U + DFU_FEATURE_PAYLOAD_LEN)
 #define TRACE_FEATURE_PAYLOAD_LEN 20U
@@ -1351,6 +1352,7 @@ static void battery_eta_task(void)
 	uint8_t pct;
 	uint8_t state;
 	uint16_t millivolts;
+	uint32_t last_update_ms;
 	bool valid;
 	k_spinlock_key_t key = k_spin_lock(&battery_cache_lock);
 
@@ -1358,6 +1360,7 @@ static void battery_eta_task(void)
 	pct = battery_percentage;
 	state = battery_state;
 	millivolts = battery_millivolts;
+	last_update_ms = battery_last_update_ms;
 	k_spin_unlock(&battery_cache_lock, key);
 
 	ARG_UNUSED(pct);
@@ -1379,7 +1382,16 @@ static void battery_eta_task(void)
 		}
 		have_state = true;
 		last_state = state;
-		batt_eta_update(now, millivolts);
+		/*
+		 * Only feed the discharge estimator while the keyboard is actively
+		 * transmitting. When the keyboard goes to sleep, telemetry packets stop.
+		 * Feeding identical millivolt readings every second would flatten the
+		 * ring buffer and destroy the computed ETA after ~17 minutes.
+		 * If telemetry is older than 60s, keep the existing computed ETA in cache.
+		 */
+		if ((now - last_update_ms) <= BATT_ETA_FRESH_TIMEOUT_MS) {
+			batt_eta_update(now, millivolts);
+		}
 	} else {
 		/* Unreported state: keep the history, do not feed it. */
 		have_state = false;
